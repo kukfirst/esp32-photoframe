@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { collectDates, exifDates, gpsFromTags, nameDates, pickDate } from "./photoMeta";
+import {
+  collectDates,
+  exifDates,
+  gpsFromTags,
+  nameDates,
+  nearestPlace,
+  pickDate,
+  textPlaceFromTags,
+} from "./photoMeta";
 
 const d = (...a) => new Date(a[0], a[1] - 1, a[2], a[3] ?? 0, a[4] ?? 0, a[5] ?? 0);
 const names = (n) => nameDates(n).map((c) => c.value.getTime());
@@ -67,5 +75,38 @@ describe("gpsFromTags", () => {
 
   it("returns null without GPS", () => {
     expect(gpsFromTags({})).toBeNull();
+  });
+});
+
+describe("XMP / IPTC place", () => {
+  it("parses XMP GPS strings", () => {
+    const tags = {
+      GPSLatitude: { description: "41,23.05N" },
+      GPSLongitude: { description: "2,10.6W" },
+    };
+    const g = gpsFromTags(tags);
+    expect(g.lat).toBeCloseTo(41.3842, 3);
+    expect(g.lon).toBeCloseTo(-2.1767, 3);
+  });
+
+  it("reads text city and country", () => {
+    expect(
+      textPlaceFromTags({ City: { description: "Barcelona" }, Country: { description: "Spain" } })
+    ).toBe("Barcelona, Spain");
+    expect(textPlaceFromTags({})).toBeNull();
+  });
+});
+
+describe("nearestPlace", () => {
+  const p = (name, date, place) => ({ name, date, place });
+  const a = p("a.jpg", d(2015, 4, 20, 17), "Barcelona, Spain");
+  it("auto within 12 h, suggestion within 72 h, nothing beyond", () => {
+    const near = p("b.jpg", d(2015, 4, 20, 9), null);
+    const far = p("c.jpg", d(2015, 4, 19, 14), null);
+    const tooFar = p("d.jpg", d(2015, 4, 10), null);
+    expect(nearestPlace(near, [a, near])).toMatchObject({ place: "Barcelona, Spain", auto: true });
+    expect(nearestPlace(far, [a, far])).toMatchObject({ from: "a.jpg", auto: false });
+    expect(nearestPlace(tooFar, [a, tooFar])).toBeNull();
+    expect(nearestPlace(p("e.jpg", null, null), [a])).toBeNull();
   });
 });

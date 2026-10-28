@@ -91,20 +91,62 @@ export function pickDate(candidates, now = new Date()) {
   return good.reduce((a, b) => (b.value < a.value ? b : a));
 }
 
+// XMP stores GPS as "41,23.05N" (degrees, decimal minutes, hemisphere) or
+// "41,23,3N"; EXIF readers give a plain decimal plus a separate ref tag.
+function parseCoord(tag, refTag, negative) {
+  const desc = tag?.description;
+  if (typeof desc === "string" && /[NSEW]\s*$/i.test(desc)) {
+    const hemi = desc.trim().slice(-1).toUpperCase();
+    const parts = desc.trim().slice(0, -1).split(",").map(Number);
+    if (parts.some((n) => !Number.isFinite(n))) return null;
+    const value = parts.reduce((acc, n, i) => acc + n / 60 ** i, 0);
+    return hemi === negative ? -value : value;
+  }
+  const value = Number(desc);
+  if (!Number.isFinite(value)) return null;
+  const ref = String(refTag?.value?.[0] ?? refTag?.description ?? "");
+  return ref.toUpperCase().startsWith(negative) ? -Math.abs(value) : Math.abs(value);
+}
+
 export function gpsFromTags(tags) {
-  const lat = Number(tags?.GPSLatitude?.description);
-  const lon = Number(tags?.GPSLongitude?.description);
-  if (!Number.isFinite(lat) || !Number.isFinite(lon) || (lat === 0 && lon === 0)) return null;
-  const latRef = String(
-    tags?.GPSLatitudeRef?.value?.[0] ?? tags?.GPSLatitudeRef?.description ?? "N"
-  );
-  const lonRef = String(
-    tags?.GPSLongitudeRef?.value?.[0] ?? tags?.GPSLongitudeRef?.description ?? "E"
-  );
-  return {
-    lat: latRef.startsWith("S") ? -Math.abs(lat) : Math.abs(lat),
-    lon: lonRef.startsWith("W") ? -Math.abs(lon) : Math.abs(lon),
-  };
+  const lat = parseCoord(tags?.GPSLatitude, tags?.GPSLatitudeRef, "S");
+  const lon = parseCoord(tags?.GPSLongitude, tags?.GPSLongitudeRef, "W");
+  if (lat === null || lon === null || (lat === 0 && lon === 0)) return null;
+  return { lat, lon };
+}
+
+// Place written as text by editors (Lightroom, Photos, digiKam) in XMP
+// (photoshop:City/Country, Iptc4xmpCore:Location) or legacy IPTC.
+const CITY_TAGS = ["City", "Sub-location", "Location"];
+const COUNTRY_TAGS = ["Country", "Country/Primary Location Name", "CountryName"];
+
+export function textPlaceFromTags(tags) {
+  const pick = (names) =>
+    names.map((n) => tags?.[n]?.description).find((v) => typeof v === "string" && v.trim());
+  const name = [pick(CITY_TAGS), pick(COUNTRY_TAGS)]
+    .filter(Boolean)
+    .map((v) => v.trim())
+    .join(", ");
+  return name || null;
+}
+
+export const NEAR_AUTO_HOURS = 12;
+export const NEAR_SUGGEST_HOURS = 72;
+
+// For a photo without a place, the closest-in-time photo of the same batch
+// that has one: used automatically within NEAR_AUTO_HOURS, offered as a
+// suggestion within NEAR_SUGGEST_HOURS.
+export function nearestPlace(target, others) {
+  if (!target.date) return null;
+  let best = null;
+  for (const o of others) {
+    if (o === target || !o.date || !o.place) continue;
+    const hours = Math.abs(o.date - target.date) / 3600000;
+    if (hours <= NEAR_SUGGEST_HOURS && (!best || hours < best.hours)) {
+      best = { place: o.place, from: o.name, hours, auto: hours <= NEAR_AUTO_HOURS };
+    }
+  }
+  return best;
 }
 
 export function formatDate(dt, locale) {

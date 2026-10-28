@@ -125,12 +125,13 @@ onUnmounted(() => {
           text="This device supports an SD card. To upload images and create multiple albums, please insert one and restart the device."
         ></v-alert>
 
+        <BatchUpload class="mb-6" />
+
         <AlbumGallery
           v-if="appStore.systemInfo.sdcard_inserted || appStore.systemInfo.has_flash_storage"
         />
 
         <ImageUpload class="mt-6" />
-        <BatchUpload class="mt-6" />
 
         <SettingsPanel class="mt-6" />
 
