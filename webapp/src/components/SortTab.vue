@@ -279,6 +279,7 @@ async function onFolderPicked(event) {
           })),
         groups: [],
         analysed: false,
+        collapsed: false,
       });
       await readFolderPlaces(folder);
       newFolders.push(folder);
@@ -364,6 +365,16 @@ function visible(photo) {
   if (filter.value === "us") return photo.us;
   if (filter.value === "checked") return photo.checked;
   return true;
+}
+
+// Remove a folder from this page only; files on the laptop and the frame are untouched.
+function removeFolder(folder) {
+  for (const p of folder.photos) if (p.thumbUrl) URL.revokeObjectURL(p.thumbUrl);
+  folders.value = folders.value.filter((f) => f !== folder);
+}
+
+function clearFolders() {
+  for (const f of [...folders.value]) removeFolder(f);
 }
 
 const checkedPhotos = computed(() =>
@@ -539,6 +550,15 @@ const personName = (id) => people.value.find((p) => p.id === id)?.name ?? "?";
         >
           Choose a folder
         </v-btn>
+        <v-btn
+          v-if="folders.length"
+          variant="text"
+          prepend-icon="mdi-close"
+          :disabled="progress.active"
+          @click="clearFolders"
+        >
+          Clear list
+        </v-btn>
         <span class="text-caption text-grey">
           Read on this computer — nothing is uploaded until you send photos to the editor.
         </span>
@@ -621,14 +641,33 @@ const personName = (id) => people.value.find((p) => p.id === id)?.name ?? "?";
       <!-- Folders -->
       <v-card v-for="folder in folders" :key="folder.id" variant="outlined" class="mb-4">
         <v-card-title class="text-subtitle-1 d-flex align-center flex-wrap ga-2">
+          <v-btn
+            :icon="folder.collapsed ? 'mdi-chevron-right' : 'mdi-chevron-down'"
+            size="x-small"
+            variant="text"
+            :title="folder.collapsed ? 'Show photos' : 'Hide photos'"
+            @click="folder.collapsed = !folder.collapsed"
+          />
           <v-icon icon="mdi-folder" size="small" />
           {{ folder.name }}
           <span class="text-caption text-grey">
             {{ folder.photos.length }} photos ·
             {{ folder.photos.filter((p) => p.checked).length }} checked
+            <template v-if="folder.photos.some((p) => p.sent)">
+              · {{ folder.photos.filter((p) => p.sent).length }} sent
+            </template>
           </span>
+          <v-spacer />
+          <v-btn
+            icon="mdi-close"
+            size="small"
+            variant="text"
+            title="Remove from this list (files are not touched)"
+            :disabled="progress.active"
+            @click="removeFolder(folder)"
+          />
         </v-card-title>
-        <v-card-text>
+        <v-card-text v-show="!folder.collapsed">
           <div class="d-flex flex-wrap ga-3 mb-3">
             <div v-for="(tok, i) in folder.tokens" :key="i" class="token">
               <v-select
