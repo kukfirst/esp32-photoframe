@@ -15,6 +15,7 @@ import {
   textPlaceFromTags,
 } from "../utils/photoMeta";
 import ProcessingControls from "./ProcessingControls.vue";
+import { getPresetOptions } from "@aitjcize/epaper-image-convert";
 import { dither } from "../utils/ditherPool";
 
 const appStore = useAppStore();
@@ -68,8 +69,9 @@ async function checkFrame() {
   }
 }
 
-async function decode(file, maxDim) {
+async function decode(file, maxDim, onSize = null) {
   const bmp = await createImageBitmap(file, { imageOrientation: "from-image" });
+  onSize?.(bmp.width, bmp.height);
   const scale = Math.min(1, maxDim / Math.max(bmp.width, bmp.height));
   if (scale === 1) return bmp;
   const c = document.createElement("canvas");
@@ -297,9 +299,21 @@ function setOwnSettings(item, own) {
 }
 
 let paramsTimer = null;
+const PRESETS = getPresetOptions(); // [{ value, title, description }]
+
+function currentPreset(item) {
+  return item.params ? item.preset : settingsStore.preset;
+}
+
+function choosePreset(item, preset) {
+  onPresetUpdate(preset);
+  onPresetChange(preset);
+}
+
 function onParamsUpdate(newParams) {
   const item = selected.value;
   if (item?.params) {
+    item.preset = "custom"; // hand-tuned values no longer match a preset
     Object.assign(item.params, newParams);
     clearTimeout(paramsTimer);
     paramsTimer = setTimeout(() => refresh(item), 400);
@@ -318,7 +332,10 @@ function onPresetChange(preset) {
   if (preset === "custom") return;
   const item = selected.value;
   if (item?.params) {
-    Object.assign(item.params, imageProcessor.getPreset(preset));
+    // Only processing values, as settingsStore.applyPreset does.
+    // eslint-disable-next-line no-unused-vars
+    const { name, title, description, ...values } = imageProcessor.getPreset(preset);
+    Object.assign(item.params, values);
     refresh(item);
   } else {
     settingsStore.applyPreset(preset);
@@ -336,6 +353,7 @@ async function addFiles(fileList) {
       name: file.name,
       mode: null,
       view: null,
+      natural: null,
       // Own settings by default; "All photos" switches a photo to the shared ones.
       params: { ...settingsStore.params },
       preset: settingsStore.preset,
@@ -369,7 +387,7 @@ async function addFiles(fileList) {
         it.placeAuto = textPlace;
         it.placeFrom = "XMP/IPTC";
       }
-      it.work = await decode(file, WORK_MAX_DIM);
+      it.work = await decode(file, WORK_MAX_DIM, (w, h) => (it.natural = { w, h }));
       it.status = "ready";
       inferPlaces();
       refresh(it);
@@ -545,6 +563,23 @@ let pinchStart = null;
 let framingTimer = null;
 let framingPending = false; // the user moved the photo within the last 500 ms
 let liveFrame = 0;
+
+// How much the visible part of the photo is stretched on the panel: above 1,
+// the panel has more pixels there than the photo does.
+const upscale = computed(() => {
+  const item = selected.value;
+  if (!item?.natural || !item.work) return 0;
+  const { width, height } = frameSize.value;
+  const { w, h } = item.natural;
+  const mode = effectiveMode(item);
+  const zoom =
+    mode === "crop"
+      ? coverZoom(item.work, width, height)
+      : mode === "manual"
+        ? (item.view?.zoom ?? 1)
+        : 1;
+  return Math.min(width / w, height / h) * zoom;
+});
 
 const isManual = computed(() => selected.value && effectiveMode(selected.value) === "manual");
 
@@ -915,6 +950,14 @@ const statusIcon = {
                   @click="setDate(selected, null)"
                   >auto</v-btn
                 >
+                <v-btn
+                  v-if="dateValue(selected)"
+                  size="x-small"
+                  variant="text"
+                  title="No date on the frame"
+                  @click="setDate(selected, '')"
+                  >none</v-btn
+                >
               </template>
             </v-text-field>
             <div class="text-caption text-grey mb-3">from: {{ dateSource(selected) }}</div>
@@ -936,6 +979,14 @@ const statusIcon = {
                   @click="setPlace(selected, null)"
                   >auto</v-btn
                 >
+                <v-btn
+                  v-if="placeValue(selected)"
+                  size="x-small"
+                  variant="text"
+                  title="No place on the frame"
+                  @click="setPlace(selected, '')"
+                  >none</v-btn
+                >
               </template>
             </v-text-field>
             <div class="text-caption text-grey">from: {{ placeSource(selected) }}</div>
@@ -955,7 +1006,8 @@ const statusIcon = {
               Use “{{ selected.near.place }}” · {{ Math.round(selected.near.hours) }} h apart
             </v-btn>
 
-            <div class="d-flex align-center flex-wrap ga-2 mt-4">
+            <div class="text-caption text-medium-emphasis mt-4 mb-1">Framing</div>
+            <div class="d-flex align-center flex-wrap ga-2">
               <v-btn-toggle
                 :model-value="effectiveMode(selected)"
                 mandatory
@@ -966,58 +1018,95 @@ const statusIcon = {
               >
                 <v-btn v-for="m in MODES" :key="m" :value="m" size="small">{{ m }}</v-btn>
               </v-btn-toggle>
-              <v-spacer />
-              <v-btn size="small" variant="text" @click="setDate(selected, '')">no date</v-btn>
-              <v-btn size="small" variant="text" @click="setPlace(selected, '')">no place</v-btn>
+              <v-chip
+                v-if="upscale > 1.05"
+                size="small"
+                :color="upscale > 2 ? 'warning' : undefined"
+                variant="tonal"
+                :title="`The visible part of the photo has fewer pixels than the panel: it is stretched ${upscale.toFixed(1)}×`"
+              >
+                stretched ×{{ upscale.toFixed(1) }}
+              </v-chip>
             </div>
+
+            <div class="d-flex align-center mt-4 mb-1">
+              <span class="text-caption text-medium-emphasis">Look</span>
+              <v-spacer />
+              <v-btn-toggle
+                :model-value="selected.params ? 'own' : 'shared'"
+                mandatory
+                density="compact"
+                variant="text"
+                divided
+                @update:model-value="setOwnSettings(selected, $event === 'own')"
+              >
+                <v-btn value="own" size="x-small" title="Settings for this photo only"
+                  >this photo</v-btn
+                >
+                <v-btn value="shared" size="x-small" title="Shared settings for all photos"
+                  >all photos</v-btn
+                >
+              </v-btn-toggle>
+            </div>
+            <div class="d-flex flex-wrap ga-1">
+              <v-btn
+                v-for="p in PRESETS"
+                :key="p.value"
+                size="small"
+                :variant="currentPreset(selected) === p.value ? 'flat' : 'outlined'"
+                :color="currentPreset(selected) === p.value ? 'primary' : undefined"
+                :title="p.description"
+                @click="choosePreset(selected, p.value)"
+              >
+                {{ p.title }}
+              </v-btn>
+              <v-chip v-if="currentPreset(selected) === 'custom'" size="small" variant="tonal"
+                >custom</v-chip
+              >
+            </div>
+            <div class="text-caption text-grey mt-1">
+              {{
+                selected.params
+                  ? "Applies to this photo only."
+                  : "Shared by every photo without its own settings."
+              }}
+            </div>
+            <v-btn
+              v-if="!selected.params"
+              variant="tonal"
+              size="small"
+              class="mt-2"
+              prepend-icon="mdi-content-save"
+              :loading="savingDefaults"
+              :disabled="!frameAwake"
+              @click="saveDefaults"
+            >
+              Save as the frame's default
+            </v-btn>
           </v-col>
 
-          <v-col cols="12">
-            <v-card variant="outlined">
-              <v-card-title class="d-flex align-center flex-wrap ga-2 text-subtitle-1">
-                Processing
-                <v-spacer />
-                <v-btn-toggle
-                  :model-value="selected.params ? 'own' : 'shared'"
-                  mandatory
-                  density="compact"
-                  variant="outlined"
-                  divided
-                  @update:model-value="setOwnSettings(selected, $event === 'own')"
-                >
-                  <v-btn value="shared" size="small">All photos</v-btn>
-                  <v-btn value="own" size="small">This photo only</v-btn>
-                </v-btn-toggle>
-              </v-card-title>
-              <v-card-text>
-                <div class="text-caption text-grey mb-3">
-                  {{
-                    selected.params
-                      ? "Changes apply to this photo only."
-                      : "Applies to every photo without its own settings. Save as default to keep it on the frame for next time."
-                  }}
-                </div>
-                <ProcessingControls
-                  :params="itemParams(selected)"
-                  :preset="selected.params ? selected.preset : settingsStore.preset"
-                  @update:params="onParamsUpdate"
-                  @update:preset="onPresetUpdate"
-                  @preset-change="onPresetChange"
-                />
-                <div v-if="!selected.params" class="d-flex justify-end mt-2">
-                  <v-btn
-                    variant="tonal"
-                    size="small"
-                    prepend-icon="mdi-content-save"
-                    :loading="savingDefaults"
-                    :disabled="!frameAwake"
-                    @click="saveDefaults"
-                  >
-                    Save as default
-                  </v-btn>
-                </div>
-              </v-card-text>
-            </v-card>
+          <v-col cols="12" class="pt-0">
+            <v-expansion-panels variant="accordion">
+              <v-expansion-panel>
+                <v-expansion-panel-title>
+                  Advanced: tone, colour matching, dithering
+                  <span class="text-caption text-grey ml-2">
+                    ({{ selected.params ? "this photo" : "all photos" }})
+                  </span>
+                </v-expansion-panel-title>
+                <v-expansion-panel-text>
+                  <ProcessingControls
+                    :params="itemParams(selected)"
+                    :preset="currentPreset(selected)"
+                    hide-preset
+                    hide-layout
+                    @update:params="onParamsUpdate"
+                    @update:preset="onPresetUpdate"
+                    @preset-change="onPresetChange"
+                  />
+                </v-expansion-panel-text>
+              </v-expansion-panel>
+            </v-expansion-panels>
           </v-col>
         </v-row>
       </template>
