@@ -21,6 +21,8 @@ import {
 } from "../utils/timezone";
 import { wideEdit } from "../utils/uiPrefs";
 
+const CACHYPC = import.meta.env.VITE_CACHYPC;
+
 const settingsStore = useSettingsStore();
 const appStore = useAppStore();
 
@@ -491,8 +493,9 @@ async function performFactoryReset() {
         <v-tab value="autoRotate"> Auto Rotate </v-tab>
         <v-tab value="power"> Power </v-tab>
         <v-tab value="homeAssistant"> Home Assistant </v-tab>
-        <v-tab value="processing"> Processing </v-tab>
-        <v-tab value="ai"> AI Generation </v-tab>
+        <!-- cachypc build: processing lives in the batch uploader, AI keys had no user left -->
+        <v-tab v-if="!CACHYPC" value="processing"> Processing </v-tab>
+        <v-tab v-if="!CACHYPC" value="ai"> AI Generation </v-tab>
         <v-tab value="calibration">
           {{ appStore.isGrayscale ? "Grayscale" : "Palette" }}
         </v-tab>

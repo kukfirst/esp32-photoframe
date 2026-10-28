@@ -600,6 +600,62 @@ function onFrameWheel(event) {
   updateView({ zoom: selected.value.view.zoom * Math.exp(-event.deltaY * 0.0015) });
 }
 
+// ---------- storage (moved here from ImageUpload.vue) and settings persistence ----------
+
+const showFormatConfirm = ref(false);
+const formatting = ref(false);
+const savingDefaults = ref(false);
+const snackbar = ref({ show: false, text: "", color: "info" });
+
+function notify(text, color = "info") {
+  snackbar.value = { show: true, text, color };
+}
+
+const hasStorage = computed(
+  () =>
+    (appStore.systemInfo.sdcard_inserted || appStore.systemInfo.has_flash_storage) &&
+    appStore.systemInfo.storage_total > 0
+);
+const storageUsedPercent = computed(() =>
+  Math.round(
+    ((appStore.systemInfo.storage_used || 0) / (appStore.systemInfo.storage_total || 1)) * 100
+  )
+);
+const storageColor = computed(() =>
+  storageUsedPercent.value > 90 ? "error" : storageUsedPercent.value > 75 ? "warning" : "success"
+);
+const mb = (bytes) => ((bytes || 0) / 1048576).toFixed(1) + " MB";
+
+async function formatStorage() {
+  formatting.value = true;
+  try {
+    const response = await fetch("/api/format-storage", { method: "POST" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    notify("Storage formatted", "success");
+    await appStore.loadSystemInfo();
+    await appStore.loadImages(appStore.selectedAlbum);
+  } catch (error) {
+    notify(`Format failed: ${error.message}`, "error");
+  } finally {
+    formatting.value = false;
+    showFormatConfirm.value = false;
+  }
+}
+
+// Shared processing settings are stored on the frame (Settings had a Processing
+// tab for this; in the cachypc build it lives here).
+async function saveDefaults() {
+  savingDefaults.value = true;
+  try {
+    if (!(await settingsStore.saveSettings())) throw new Error("the frame did not accept them");
+    notify("Saved as the frame's default processing", "success");
+  } catch (error) {
+    notify(`Could not save: ${error.message}`, "error");
+  } finally {
+    savingDefaults.value = false;
+  }
+}
+
 const statusIcon = {
   reading: "mdi-timer-sand",
   uploading: "mdi-upload",
@@ -614,6 +670,25 @@ const statusIcon = {
       <v-icon icon="mdi-image-multiple" class="mr-1" />
       Upload photos
       <v-spacer />
+      <template v-if="hasStorage">
+        <v-icon
+          :icon="appStore.systemInfo.sdcard_inserted ? 'mdi-sd' : 'mdi-database'"
+          size="small"
+        />
+        <span class="text-body-2 text-medium-emphasis">
+          {{ mb(appStore.systemInfo.storage_used) }} / {{ mb(appStore.systemInfo.storage_total) }}
+        </span>
+        <v-chip size="x-small" :color="storageColor" variant="flat" class="text-white">
+          {{ storageUsedPercent }}%
+        </v-chip>
+        <v-btn
+          icon="mdi-delete-sweep"
+          size="x-small"
+          variant="text"
+          title="Format storage"
+          @click="showFormatConfirm = true"
+        />
+      </template>
       <v-chip
         size="small"
         :color="frameAwake === null ? 'grey' : frameAwake ? 'success' : 'warning'"
@@ -903,7 +978,7 @@ const statusIcon = {
                   {{
                     selected.params
                       ? "Changes apply to this photo only."
-                      : "Shared with Settings → Processing: changes apply to every photo without its own settings. Save Settings there to keep them."
+                      : "Applies to every photo without its own settings. Save as default to keep it on the frame for next time."
                   }}
                 </div>
                 <ProcessingControls
@@ -913,12 +988,43 @@ const statusIcon = {
                   @update:preset="onPresetUpdate"
                   @preset-change="onPresetChange"
                 />
+                <div v-if="!selected.params" class="d-flex justify-end mt-2">
+                  <v-btn
+                    variant="tonal"
+                    size="small"
+                    prepend-icon="mdi-content-save"
+                    :loading="savingDefaults"
+                    :disabled="!frameAwake"
+                    @click="saveDefaults"
+                  >
+                    Save as default
+                  </v-btn>
+                </div>
               </v-card-text>
             </v-card>
           </v-col>
         </v-row>
       </template>
     </v-card-text>
+    <v-dialog v-model="showFormatConfirm" max-width="400">
+      <v-card>
+        <v-card-title>Format Storage</v-card-title>
+        <v-card-text>
+          This will erase all images
+          {{ appStore.systemInfo.sdcard_inserted ? "on the SD card" : "on internal storage" }}. This
+          action cannot be undone.
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="showFormatConfirm = false">Cancel</v-btn>
+          <v-btn color="error" :loading="formatting" @click="formatStorage">Format</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-snackbar v-model="snackbar.show" :color="snackbar.color" :timeout="4000">
+      {{ snackbar.text }}
+    </v-snackbar>
   </v-card>
 </template>
 

@@ -6,9 +6,11 @@ import AlbumGallery from "../components/AlbumGallery.vue";
 import ImageUpload from "../components/ImageUpload.vue";
 // cachypc fork: only the PC-hosted build has the batch uploader (its worker is
 // not among the files the firmware embeds).
-const BatchUpload = import.meta.env.VITE_CACHYPC
+const CACHYPC = import.meta.env.VITE_CACHYPC;
+const BatchUpload = CACHYPC
   ? defineAsyncComponent(() => import("../components/BatchUpload.vue"))
   : null;
+const pageTab = ref("photos");
 import SettingsPanel from "../components/SettingsPanel.vue";
 import OtaUpdate from "../components/OtaUpdate.vue";
 
@@ -129,17 +131,36 @@ onUnmounted(() => {
           text="This device supports an SD card. To upload images and create multiple albums, please insert one and restart the device."
         ></v-alert>
 
-        <BatchUpload v-if="BatchUpload" class="mb-6" />
+        <!-- cachypc build: batch upload replaces single upload; settings on their own tab.
+             v-show keeps the batch (and its photos) alive while on the Settings tab. -->
+        <template v-if="CACHYPC">
+          <v-tabs v-model="pageTab" color="primary" class="mb-4">
+            <v-tab value="photos" prepend-icon="mdi-image-multiple">Photos</v-tab>
+            <v-tab value="settings" prepend-icon="mdi-cog">Settings</v-tab>
+          </v-tabs>
+          <div v-show="pageTab === 'photos'">
+            <BatchUpload class="mb-6" />
+            <AlbumGallery
+              v-if="appStore.systemInfo.sdcard_inserted || appStore.systemInfo.has_flash_storage"
+            />
+          </div>
+          <div v-show="pageTab === 'settings'">
+            <SettingsPanel />
+            <OtaUpdate class="mt-6" />
+          </div>
+        </template>
 
-        <AlbumGallery
-          v-if="appStore.systemInfo.sdcard_inserted || appStore.systemInfo.has_flash_storage"
-        />
+        <template v-else>
+          <AlbumGallery
+            v-if="appStore.systemInfo.sdcard_inserted || appStore.systemInfo.has_flash_storage"
+          />
 
-        <ImageUpload class="mt-6" />
+          <ImageUpload class="mt-6" />
 
-        <SettingsPanel class="mt-6" />
+          <SettingsPanel class="mt-6" />
 
-        <OtaUpdate class="mt-6" />
+          <OtaUpdate class="mt-6" />
+        </template>
       </v-container>
     </v-main>
 

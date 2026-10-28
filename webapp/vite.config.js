@@ -27,6 +27,8 @@ function gzipOutput(outDir) {
 }
 
 export default defineConfig({
+  // cachypc fork: compile out the PC-only batch uploader and its worker.
+  define: { "import.meta.env.VITE_CACHYPC": "false" },
   plugins: [
     vue(),
     vuetify({
