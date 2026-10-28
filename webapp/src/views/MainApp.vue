@@ -4,6 +4,7 @@ import { useAppStore, useSettingsStore } from "../stores";
 import AppHeader from "../components/AppHeader.vue";
 import AlbumGallery from "../components/AlbumGallery.vue";
 import ImageUpload from "../components/ImageUpload.vue";
+import BatchUpload from "../components/BatchUpload.vue";
 import SettingsPanel from "../components/SettingsPanel.vue";
 import OtaUpdate from "../components/OtaUpdate.vue";
 
@@ -129,6 +130,7 @@ onUnmounted(() => {
         />
 
         <ImageUpload class="mt-6" />
+        <BatchUpload class="mt-6" />
 
         <SettingsPanel class="mt-6" />
 
