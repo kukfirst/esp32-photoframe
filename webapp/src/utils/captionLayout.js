@@ -89,7 +89,13 @@ export function composeFrame(img, { width: W, height: H, mode = "fit", lines = [
     const sw = W / scale;
     const sh = areaH / scale;
     ctx.drawImage(img, (pw - sw) / 2, (ph - sh) / 2, sw, sh, 0, 0, W, areaH);
-    if (caption.length) capBox = [0, areaH, W, H];
+    if (caption.length) {
+      // A blurred strip under a cropped photo reads as a smear; solid black is
+      // a clean panel ink and the caption plate blends into it.
+      ctx.fillStyle = "#000";
+      ctx.fillRect(0, areaH, W, H - areaH);
+      capBox = [0, areaH, W, H];
+    }
   } else {
     let scale = Math.min(W / pw, H / ph);
     let sw = Math.round(pw * scale);

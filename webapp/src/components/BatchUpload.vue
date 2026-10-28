@@ -154,9 +154,9 @@ function itemParams(item) {
   return item.params ?? settingsStore.params;
 }
 
-// Scale Mode in the processing settings is the default; a per-photo choice wins.
+// Fit keeps the whole photo; crop is a per-photo choice.
 function effectiveMode(item) {
-  return item.mode ?? (itemParams(item).scaleMode === "fit" ? "fit" : "crop");
+  return item.mode ?? "fit";
 }
 
 function setMode(item, mode) {
@@ -461,20 +461,23 @@ async function uploadAll() {
 
 // ---------- compare slider (same interaction as ImageProcessing.vue) ----------
 
-const sliding = ref(false);
+// Pointer capture keeps the drag on the slider even when the pointer leaves
+// the preview, and avoids the browser's native image drag.
 function slideTo(event) {
   const rect = event.currentTarget.getBoundingClientRect();
-  const x = (event.touches?.[0]?.clientX ?? event.clientX) - rect.left;
-  sliderPosition.value = Math.max(0, Math.min(100, (x / rect.width) * 100));
+  sliderPosition.value = Math.max(
+    0,
+    Math.min(100, ((event.clientX - rect.left) / rect.width) * 100)
+  );
 }
 
 function onSlideStart(event) {
-  sliding.value = true;
+  event.currentTarget.setPointerCapture(event.pointerId);
   slideTo(event);
 }
 
 function onSlideMove(event) {
-  if (sliding.value) slideTo(event);
+  if (event.currentTarget.hasPointerCapture(event.pointerId)) slideTo(event);
 }
 
 const statusIcon = {
@@ -605,19 +608,16 @@ const statusIcon = {
             <div
               class="compare"
               :style="{ aspectRatio: frameSize.width / frameSize.height }"
-              @mousedown="onSlideStart"
-              @mousemove="onSlideMove"
-              @mouseup="sliding = false"
-              @mouseleave="sliding = false"
-              @touchstart.passive="slideTo"
-              @touchmove.passive="slideTo"
+              @pointerdown.prevent="onSlideStart"
+              @pointermove="onSlideMove"
             >
               <template v-if="preview.original">
-                <img :src="preview.original" alt="" class="compare-img" />
+                <img :src="preview.original" alt="" class="compare-img" draggable="false" />
                 <img
                   :src="preview.processed"
                   alt=""
                   class="compare-img"
+                  draggable="false"
                   :style="{ clipPath: `inset(0 0 0 ${sliderPosition}%)` }"
                 />
                 <div class="slider-line" :style="{ left: `${sliderPosition}%` }">
@@ -836,6 +836,7 @@ const statusIcon = {
   border-radius: 6px;
   overflow: hidden;
   user-select: none;
+  touch-action: pan-y;
   cursor: ew-resize;
 }
 .compare-img {
