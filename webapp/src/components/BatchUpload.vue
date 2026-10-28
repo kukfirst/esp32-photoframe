@@ -17,7 +17,7 @@ import {
 import ProcessingControls from "./ProcessingControls.vue";
 import { getPresetOptions } from "@aitjcize/epaper-image-convert";
 import { dither } from "../utils/ditherPool";
-import { editRequest } from "../utils/editRequest";
+import { editRequest, importRequest } from "../utils/editRequest";
 
 const appStore = useAppStore();
 const settingsStore = useSettingsStore();
@@ -377,9 +377,11 @@ function newItem(file, extra = {}) {
 }
 
 async function addFiles(fileList) {
+  const added = [];
   for (const file of Array.from(fileList || [])) {
     if (!file.type.startsWith("image/")) continue;
     const it = newItem(file);
+    added.push(it);
     if (selectedId.value === null) selectedId.value = it.id;
     try {
       let tags = {};
@@ -414,7 +416,23 @@ async function addFiles(fileList) {
       it.error = `Cannot read this image: ${e.message}`;
     }
   }
+  return added;
 }
+
+// Photos checked in the Sort tab arrive with the place chosen there and the
+// folder's month for photos without a capture date.
+watch(importRequest, async (entries) => {
+  if (!entries) return;
+  importRequest.value = null;
+  for (const e of entries) {
+    const [it] = await addFiles([e.file]);
+    if (!it) continue;
+    if (e.place) it.placeText = e.place;
+    if (!it.dateAuto && e.dateFallback) it.dateText = e.dateFallback;
+    refresh(it);
+  }
+  notify(`${entries.length} photos from Sort added`, "success");
+});
 
 // ---------- library of originals (cachypc/upscale/server.py) ----------
 

@@ -10,6 +10,10 @@ settings here, keyed by the frame path ("Album/name.epdgz"):
     DELETE     /library/item?key=K
     GET        /library/keys           all keys
 
+Sort tab data: GET /sortdata/<file> serves the face models and the gazetteer
+from ~/models/photoframe (whitelisted names); GET/PUT /faces keeps the people
+the owner tagged (reference face embeddings), in the library folder.
+
 POST /upscale with a PNG/JPEG body -> 4x PNG, or a JSON error the page shows
 as is. Before every job it checks free VRAM with nvidia-smi and refuses to
 start when no GPU has enough (the local LLM often holds most of it). Each job
@@ -41,6 +45,13 @@ MAX_SIDE = 1600  # input side limit: 4x of this is already far beyond the panel
 JOB_TIMEOUT = 180
 LIBRARY = Path(os.environ.get("PHOTOFRAME_LIBRARY", str(Path.home() / "Pictures/photoframe-library")))
 MAX_SOURCE_BYTES = 80 * 1024 * 1024
+SORTDATA = Path(os.environ.get("PHOTOFRAME_SORTDATA", str(Path.home() / "models/photoframe")))
+SORTDATA_FILES = {
+    "det_500m.onnx": "application/octet-stream",
+    "w600k_mbf.onnx": "application/octet-stream",
+    "gazetteer.json": "application/json",
+}
+FACES = LIBRARY / "_people.json"
 
 busy = threading.Lock()
 
@@ -192,8 +203,36 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return self._json(400, {"error": "Invalid JSON."})
 
+    def _send_file(self, f: Path, ctype: str) -> None:
+        # Serve a pre-compressed copy when there is one (the gazetteer is 4.6 MB raw).
+        gz = f.with_name(f.name + ".gz")
+        use_gz = gz.is_file() and "gzip" in (self.headers.get("Accept-Encoding") or "")
+        body = (gz if use_gz else f).read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "max-age=86400")
+        if use_gz:
+            self.send_header("Content-Encoding", "gzip")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_PUT(self):  # noqa: N802
         path, key = self._route()
+        if path == "/faces":
+            try:
+                people = json.loads(self._body(4 * 1048576))
+                if not isinstance(people, dict):
+                    raise ValueError
+            except Refused as e:
+                return self._json(e.status, {"error": str(e)})
+            except ValueError:
+                return self._json(400, {"error": "Invalid JSON."})
+            LIBRARY.mkdir(parents=True, exist_ok=True)
+            tmp = FACES.with_suffix(".tmp")
+            tmp.write_text(json.dumps(people))
+            tmp.replace(FACES)
+            return self._json(200, {"saved": len(people.get("people", []))})
         self._library("PUT", path, key)
 
     def do_DELETE(self):  # noqa: N802
@@ -204,6 +243,14 @@ class Handler(BaseHTTPRequestHandler):
         path, key = self._route()
         if path.startswith("/library/"):
             return self._library("GET", path, key)
+        if path == "/faces":
+            return self._json(200, json.loads(FACES.read_text()) if FACES.is_file() else {"people": []})
+        if path.startswith("/sortdata/"):
+            name = path.removeprefix("/sortdata/")
+            f = SORTDATA / name
+            if name not in SORTDATA_FILES or not f.is_file():
+                return self._json(404, {"error": f"{name} is not in {SORTDATA} (see cachypc/sort/README)."})
+            return self._send_file(f, SORTDATA_FILES[name])
         if path == "/upscale/status":
             try:
                 gpus = gpu_free_mb()

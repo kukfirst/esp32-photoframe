@@ -11,6 +11,7 @@ const BatchUpload = CACHYPC
   ? defineAsyncComponent(() => import("../components/BatchUpload.vue"))
   : null;
 const pageTab = ref("photos");
+const SortTab = CACHYPC ? defineAsyncComponent(() => import("../components/SortTab.vue")) : null;
 
 function editFromGallery(image) {
   editRequest.value = { album: image.album, filename: image.filename };
@@ -141,10 +142,14 @@ onUnmounted(() => {
              v-show keeps the batch (and its photos) alive while on the Settings tab. -->
         <template v-if="CACHYPC">
           <v-tabs v-model="pageTab" color="primary" class="mb-4">
+            <v-tab value="sort" prepend-icon="mdi-folder-search">Sort</v-tab>
             <v-tab value="photos" prepend-icon="mdi-image-multiple">Photos</v-tab>
             <v-tab value="gallery" prepend-icon="mdi-view-grid">Gallery</v-tab>
             <v-tab value="settings" prepend-icon="mdi-cog">Settings</v-tab>
           </v-tabs>
+          <div v-show="pageTab === 'sort'">
+            <SortTab @sent="pageTab = 'photos'" />
+          </div>
           <div v-show="pageTab === 'photos'">
             <BatchUpload />
           </div>
