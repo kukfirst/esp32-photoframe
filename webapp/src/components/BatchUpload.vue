@@ -243,12 +243,9 @@ async function renderPreview() {
   item.full ??= await decode(item.file, 4096);
   if (token !== previewToken) return;
   const frame = compose(item, item.full);
-  // The original side updates at once; the processed side when the worker is done.
-  frame.toBlob(
-    (blob) => token === previewToken && swapUrl(preview.value, "original", blob),
-    "image/jpeg",
-    0.9
-  );
+  // Both sides change together when the worker is done, so the view never
+  // shows a new original next to a stale processed frame.
+  const originalBlob = new Promise((r) => frame.toBlob(r, "image/jpeg", 0.9));
   const out = await dither(
     "preview",
     "preview",
@@ -257,8 +254,11 @@ async function renderPreview() {
     perceivedOptions(item, frame)
   ).catch(() => ({ stale: true }));
   if (out.stale || token !== previewToken) return;
+  swapUrl(preview.value, "original", await originalBlob);
   swapUrl(preview.value, "processed", out.blob);
   preview.value.busy = false;
+  // The live (undithered) frame stays up until this point while framing.
+  if (!framingPending) framing.value = false;
 }
 
 function refresh(item) {
@@ -336,8 +336,9 @@ async function addFiles(fileList) {
       name: file.name,
       mode: null,
       view: null,
-      params: null,
-      preset: null,
+      // Own settings by default; "All photos" switches a photo to the shared ones.
+      params: { ...settingsStore.params },
+      preset: settingsStore.preset,
       dateAuto: null,
       dateText: null,
       gps: null,
@@ -507,13 +508,32 @@ function slideTo(event) {
   );
 }
 
-function onSlideStart(event) {
+let draggingSlider = false;
+
+function onPreviewDown(event) {
   event.currentTarget.setPointerCapture(event.pointerId);
-  slideTo(event);
+  if (!isManual.value || event.target.closest(".slider-handle")) {
+    draggingSlider = true;
+    slideTo(event);
+  } else {
+    onFrameDown(event);
+  }
 }
 
-function onSlideMove(event) {
-  if (event.currentTarget.hasPointerCapture(event.pointerId)) slideTo(event);
+function onPreviewMove(event) {
+  if (draggingSlider) slideTo(event);
+  else if (isManual.value) onFrameMove(event);
+}
+
+function onPreviewUp(event) {
+  draggingSlider = false;
+  onFrameUp(event);
+}
+
+function onPreviewWheel(event) {
+  if (!isManual.value) return;
+  event.preventDefault();
+  onFrameWheel(event);
 }
 
 // ---------- manual framing: drag to pan, wheel / pinch / slider to zoom ----------
@@ -523,6 +543,7 @@ const framing = ref(false); // true while the user is moving the photo
 const pointers = new Map();
 let pinchStart = null;
 let framingTimer = null;
+let framingPending = false; // the user moved the photo within the last 500 ms
 let liveFrame = 0;
 
 const isManual = computed(() => selected.value && effectiveMode(selected.value) === "manual");
@@ -536,8 +557,11 @@ function drawLive() {
     const canvas = liveCanvas.value;
     if (!item?.work || !canvas) return;
     const frame = compose(item, item.work, 0.5);
-    canvas.width = frame.width;
-    canvas.height = frame.height;
+    // Resizing a canvas clears it; only do it when the size really changes.
+    if (canvas.width !== frame.width || canvas.height !== frame.height) {
+      canvas.width = frame.width;
+      canvas.height = frame.height;
+    }
     canvas.getContext("2d").drawImage(frame, 0, 0);
   });
 }
@@ -547,10 +571,11 @@ function updateView(patch) {
   const { width, height } = frameSize.value;
   item.view = clampView(item.work, width, height, { ...item.view, ...patch });
   framing.value = true;
+  framingPending = true;
   nextTick(drawLive);
   clearTimeout(framingTimer);
   framingTimer = setTimeout(() => {
-    framing.value = false;
+    framingPending = false;
     refresh(item);
   }, 500);
 }
@@ -801,31 +826,14 @@ const statusIcon = {
         <v-row v-if="selected">
           <v-col cols="12" md="8">
             <div
-              v-if="isManual"
-              class="compare framing"
-              :style="{ aspectRatio: frameSize.width / frameSize.height }"
-              @pointerdown.prevent="onFrameDown"
-              @pointermove="onFrameMove"
-              @pointerup="onFrameUp"
-              @pointercancel="onFrameUp"
-              @wheel.prevent="onFrameWheel"
-            >
-              <canvas v-show="framing" ref="liveCanvas" class="compare-img" />
-              <img
-                v-if="!framing && preview.processed"
-                :src="preview.processed"
-                alt=""
-                class="compare-img"
-                draggable="false"
-              />
-              <v-progress-linear v-if="preview.busy" indeterminate class="compare-busy" />
-            </div>
-            <div
-              v-else
               class="compare"
+              :class="{ framing: isManual }"
               :style="{ aspectRatio: frameSize.width / frameSize.height }"
-              @pointerdown.prevent="onSlideStart"
-              @pointermove="onSlideMove"
+              @pointerdown.prevent="onPreviewDown"
+              @pointermove="onPreviewMove"
+              @pointerup="onPreviewUp"
+              @pointercancel="onPreviewUp"
+              @wheel="onPreviewWheel"
             >
               <template v-if="preview.original">
                 <img :src="preview.original" alt="" class="compare-img" draggable="false" />
@@ -836,12 +844,18 @@ const statusIcon = {
                   draggable="false"
                   :style="{ clipPath: `inset(0 0 0 ${sliderPosition}%)` }"
                 />
-                <div class="slider-line" :style="{ left: `${sliderPosition}%` }">
-                  <div class="slider-handle">
-                    <v-icon size="small">mdi-arrow-left-right</v-icon>
-                  </div>
-                </div>
               </template>
+              <canvas v-show="isManual && framing" ref="liveCanvas" class="compare-img" />
+              <div
+                v-if="preview.original"
+                v-show="!(isManual && framing)"
+                class="slider-line"
+                :style="{ left: `${sliderPosition}%` }"
+              >
+                <div class="slider-handle" title="Drag to compare">
+                  <v-icon size="small">mdi-arrow-left-right</v-icon>
+                </div>
+              </div>
               <v-progress-linear v-if="preview.busy" indeterminate class="compare-busy" />
             </div>
             <div v-if="isManual" class="d-flex align-center ga-2 mt-1">
@@ -856,7 +870,9 @@ const statusIcon = {
                 @update:model-value="updateView({ zoom: $event })"
               />
               <v-icon icon="mdi-magnify-plus-outline" size="small" />
-              <span class="text-caption text-grey ml-2">drag to move · wheel or pinch to zoom</span>
+              <span class="text-caption text-grey ml-2"
+                >drag to move · wheel or pinch to zoom · drag ↔ to compare</span
+              >
             </div>
             <div v-else class="d-flex justify-space-between mt-1">
               <span class="text-caption">← Original</span>
@@ -1130,6 +1146,8 @@ const statusIcon = {
   pointer-events: none;
 }
 .slider-handle {
+  pointer-events: auto;
+  cursor: ew-resize;
   position: absolute;
   top: 50%;
   left: 50%;
