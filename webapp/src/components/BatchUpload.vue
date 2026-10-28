@@ -2,9 +2,10 @@
 // Batch upload with date/place captions (cachypc fork). Each photo is composed
 // into a full frame (photo + blurred fill + caption off the photo), then goes
 // through the same processing and upload path as ImageUpload.vue.
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import { useAppStore, useSettingsStore } from "../stores";
 import { MODES, composeFrame } from "../utils/captionLayout";
+import ProcessingControls from "./ProcessingControls.vue";
 import {
   collectDates,
   formatDate,
@@ -23,7 +24,6 @@ const WORK_MAX_DIM = 900; // decoded size kept per photo for the on-page preview
 const items = ref([]);
 const fileInput = ref(null);
 const showCaption = ref(true);
-const defaultMode = ref("fit");
 const uploading = ref(false);
 const frameAwake = ref(null);
 const previewDialog = ref(false);
@@ -39,6 +39,7 @@ onMounted(async () => {
     import("exifreader").then((m) => m.default),
   ]);
   checkFrame();
+  rerenderAll();
 });
 
 // Logical frame size with the applied orientation, as the preview uses it.
@@ -81,20 +82,71 @@ function captionLines(item) {
   return [date, place];
 }
 
+// Scale Mode in the processing settings is the default; a per-photo choice wins.
+function effectiveMode(item) {
+  return item.mode ?? (settingsStore.params.scaleMode === "fit" ? "fit" : "crop");
+}
+
+function setMode(item, mode) {
+  item.mode = mode;
+  renderThumb(item);
+}
+
+// Thumbnails are dithered at half resolution with the current settings, so
+// the grid shows what the panel will show. Renders run one at a time; a newer
+// request for the same item supersedes an older queued one.
+let renderChain = Promise.resolve();
+
 function renderThumb(item) {
   if (!item.work) return;
-  const { width, height } = frameSize.value;
-  const canvas = composeFrame(item.work, {
-    width: Math.round(width / 2),
-    height: Math.round(height / 2),
-    mode: item.mode,
-    lines: captionLines(item),
+  const token = (item.renderToken = (item.renderToken || 0) + 1);
+  item.rendering = true;
+  renderChain = renderChain.then(async () => {
+    if (token !== item.renderToken || !imageProcessor) return;
+    await new Promise((r) => setTimeout(r, 0)); // let the UI paint between renders
+    const width = Math.round(frameSize.value.width / 2);
+    const height = Math.round(frameSize.value.height / 2);
+    const frame = composeFrame(item.work, {
+      width,
+      height,
+      mode: effectiveMode(item),
+      lines: captionLines(item),
+    });
+    const result = imageProcessor.processImage(frame, {
+      displayWidth: width,
+      displayHeight: height,
+      palette: palette(),
+      params: { ...settingsStore.params },
+      orientation: null,
+      scaleMode: "cover",
+      usePerceivedOutput: true,
+    });
+    if (token !== item.renderToken) return;
+    item.thumb = result.canvas.toDataURL("image/png");
+    item.rendering = false;
   });
-  item.thumb = canvas.toDataURL("image/jpeg", 0.85);
 }
 
 function rerenderAll() {
   items.value.forEach(renderThumb);
+}
+
+let settingsTimer = null;
+watch(
+  () => [settingsStore.params, settingsStore.palette, showCaption.value],
+  () => {
+    clearTimeout(settingsTimer);
+    settingsTimer = setTimeout(rerenderAll, 400);
+  },
+  { deep: true }
+);
+
+function onParamsUpdate(newParams) {
+  Object.assign(settingsStore.params, newParams);
+}
+
+function onPresetChange(preset) {
+  if (preset !== "custom") settingsStore.applyPreset(preset);
 }
 
 async function addFiles(fileList) {
@@ -104,7 +156,9 @@ async function addFiles(fileList) {
       id: nextId++,
       file,
       name: file.name,
-      mode: defaultMode.value,
+      mode: null,
+      rendering: false,
+      renderToken: 0,
       dateAuto: null,
       candidates: [],
       dateText: null,
@@ -206,7 +260,7 @@ async function processItem(item, perceived) {
   const full = await decode(item.file, 4096);
   const frame = composeFrame(full, {
     ...frameSize.value,
-    mode: item.mode,
+    mode: effectiveMode(item),
     lines: captionLines(item),
   });
   // The device gets native panel dimensions (the library rotates the output);
@@ -304,6 +358,17 @@ const statusColor = {
       <v-icon icon="mdi-image-multiple" class="mr-1" />
       Batch upload with captions
       <v-spacer />
+      <v-btn
+        v-if="items.length"
+        color="primary"
+        variant="flat"
+        size="small"
+        :loading="uploading"
+        :disabled="!pending.length || !frameAwake"
+        @click="uploadAll"
+      >
+        Upload {{ pending.length }} to “{{ appStore.selectedAlbum }}”
+      </v-btn>
       <v-chip
         size="small"
         :color="frameAwake === null ? 'grey' : frameAwake ? 'success' : 'warning'"
@@ -345,32 +410,49 @@ const statusColor = {
         </p>
       </v-sheet>
 
-      <div class="d-flex flex-wrap align-center ga-4 mb-4">
-        <v-switch
-          v-model="showCaption"
-          label="Date & place caption"
-          hide-details
-          density="compact"
-          @update:model-value="rerenderAll"
-        />
-        <v-btn-toggle v-model="defaultMode" mandatory density="compact" variant="outlined" divided>
-          <v-btn value="fit">Fit</v-btn>
-          <v-btn value="crop">Crop</v-btn>
-        </v-btn-toggle>
-        <span class="text-caption text-grey">default for new photos</span>
-      </div>
+      <v-switch
+        v-model="showCaption"
+        label="Date & place caption"
+        hide-details
+        density="compact"
+        class="mb-2"
+      />
+
+      <v-expansion-panels class="mb-4">
+        <v-expansion-panel>
+          <v-expansion-panel-title>
+            Processing — {{ settingsStore.preset }}, default
+            {{ settingsStore.params.scaleMode === "fit" ? "fit" : "crop" }}
+          </v-expansion-panel-title>
+          <v-expansion-panel-text>
+            <div class="text-caption text-grey mb-3">
+              Same settings as Settings → Processing. Previews below update as you change them; use
+              Save Settings there to keep them for next time.
+            </div>
+            <ProcessingControls
+              :params="settingsStore.params"
+              :preset="settingsStore.preset"
+              @update:params="onParamsUpdate"
+              @update:preset="settingsStore.preset = $event"
+              @preset-change="onPresetChange"
+            />
+          </v-expansion-panel-text>
+        </v-expansion-panel>
+      </v-expansion-panels>
 
       <v-row v-if="items.length" dense>
         <v-col v-for="item in items" :key="item.id" cols="12" sm="6" lg="4">
           <v-card variant="outlined" :color="item.status === 'error' ? 'error' : undefined">
-            <img
-              v-if="item.thumb"
-              :src="item.thumb"
-              alt=""
-              class="batch-thumb"
-              title="Show as the panel will render it"
-              @click="openPreview(item)"
-            />
+            <div v-if="item.thumb" class="batch-thumb-wrap">
+              <img
+                :src="item.thumb"
+                alt=""
+                class="batch-thumb"
+                title="Full-size panel preview"
+                @click="openPreview(item)"
+              />
+              <v-progress-linear v-if="item.rendering" indeterminate class="batch-thumb-busy" />
+            </div>
             <div
               v-else
               class="d-flex align-center justify-center bg-grey-lighten-3"
@@ -427,12 +509,12 @@ const statusColor = {
               </v-text-field>
               <div class="d-flex align-center flex-wrap ga-1">
                 <v-btn-toggle
-                  v-model="item.mode"
+                  :model-value="effectiveMode(item)"
                   mandatory
                   density="compact"
                   variant="outlined"
                   divided
-                  @update:model-value="renderThumb(item)"
+                  @update:model-value="setMode(item, $event)"
                 >
                   <v-btn v-for="m in MODES" :key="m" :value="m" size="small">{{ m }}</v-btn>
                 </v-btn-toggle>
@@ -466,12 +548,12 @@ const statusColor = {
       </v-row>
     </v-card-text>
 
-    <v-card-actions v-if="items.length" class="flex-wrap ga-2 px-4 pb-4">
+    <v-card-actions v-if="items.length" class="flex-wrap ga-2 px-4 pb-16">
       <v-btn
         color="primary"
         variant="flat"
         :loading="uploading"
-        :disabled="!pending.length"
+        :disabled="!pending.length || !frameAwake"
         @click="uploadAll"
       >
         Upload {{ pending.length }} to “{{ appStore.selectedAlbum }}”
@@ -503,6 +585,15 @@ const statusColor = {
 </template>
 
 <style scoped>
+.batch-thumb-wrap {
+  position: relative;
+}
+.batch-thumb-busy {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+}
 .batch-thumb {
   display: block;
   width: 100%;
