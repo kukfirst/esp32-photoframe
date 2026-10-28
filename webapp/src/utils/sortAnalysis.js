@@ -7,7 +7,9 @@ export const FACE = {
   match: 0.3, // cosine to a tagged person (same person 0.37-0.77, others <= 0.20 on the owner's photos)
   cluster: 0.35,
 };
-export const BURST = { seconds: 20, hamming: 12 };
+// Near-identical shots (dHash distance over 64 bits) and the same scene from a
+// slightly different angle shortly after; only the best of such a run is pre-checked.
+export const BURST = { seconds: 20, hamming: 12, sceneSeconds: 90, sceneHamming: 22 };
 
 // ---------- worker pool ----------
 
@@ -126,12 +128,12 @@ export function markBursts(photos) {
   for (const p of photos) {
     p.dupOf = null;
     p.burstSize = 1;
+    const dt = p.time != null && prev?.time != null ? Math.abs(p.time - prev.time) / 1000 : null;
+    const dist = prev ? hamming(p.hash, prev.hash) : 64;
     const close =
-      prev &&
-      p.time != null &&
-      prev.time != null &&
-      Math.abs(p.time - prev.time) <= BURST.seconds * 1000 &&
-      hamming(p.hash, prev.hash) <= BURST.hamming;
+      dt != null &&
+      ((dt <= BURST.seconds && dist <= BURST.hamming) ||
+        (dt <= BURST.sceneSeconds && dist <= BURST.sceneHamming));
     if (!close) flush();
     burst.push(p);
     prev = p;

@@ -67,6 +67,18 @@ describe("markBursts", () => {
     expect(photos.map((p) => p.dupOf)).toEqual([2, null, 2, null]);
     expect(photos[1].burstSize).toBe(3);
   });
+
+  it("also folds the same scene shot again within a minute and a half", () => {
+    const a = "0".repeat(64);
+    const b = "1".repeat(18) + "0".repeat(46); // 18 bits apart: same scene, new angle
+    const photos = [
+      { id: 1, time: 0, hash: a, score: 10 },
+      { id: 2, time: 60_000, hash: b, score: 40 },
+      { id: 3, time: 400_000, hash: b, score: 5 }, // later: not folded by scene rule
+    ];
+    markBursts(photos);
+    expect(photos.map((p) => p.dupOf)).toEqual([2, null, null]);
+  });
 });
 
 describe("clusterFaces", () => {

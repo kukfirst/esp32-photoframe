@@ -164,7 +164,7 @@ function effectiveMode(item) {
 }
 
 function setMode(item, mode) {
-  if (mode === "manual" && !item.view && item.work) {
+  if (mode === "manual" && effectiveMode(item) !== "manual" && item.work) {
     // Start manual framing from what the photo looks like now.
     const { width, height } = frameSize.value;
     const zoom = effectiveMode(item) === "crop" ? coverZoom(item.work, width, height) : 1;
@@ -228,7 +228,7 @@ async function renderTile(item) {
   const frame = compose(item, item.work, TILE_SCALE);
   const bitmap = await createImageBitmap(frame);
   const out = await dither(
-    "background",
+    "tiles",
     `tile:${item.id}`,
     "preview",
     bitmap,
@@ -345,6 +345,39 @@ function onPresetChange(preset) {
 
 // ---------- adding photos ----------
 
+const AUTO_CROP_KEEP = 0.75; // crop when at least this share of the photo stays visible
+
+// Crop when the photo is close to the frame's shape (16:9, 3:2 on a 4:3 frame);
+// fit when cropping would cut too much (portraits) unless the faces, known from
+// the Sort tab, fit in a crop window: then crop around them.
+function autoFrame(item) {
+  if (item.mode !== null || !item.natural) return;
+  const { width: W, height: H } = frameSize.value;
+  const pa = item.natural.w / item.natural.h;
+  const fa = W / H;
+  const keep = Math.min(pa, fa) / Math.max(pa, fa);
+  if (keep >= AUTO_CROP_KEEP) {
+    item.mode = "crop";
+    return;
+  }
+  const fb = item.faceBox;
+  if (fb) {
+    // Visible share of the photo when it covers the frame.
+    const winW = pa > fa ? fa / pa : 1;
+    const winH = pa > fa ? 1 : pa / fa;
+    if (fb[2] - fb[0] <= winW * 0.9 && fb[3] - fb[1] <= winH * 0.9) {
+      item.mode = "manual";
+      item.view = clampView(item.work, W, H, {
+        zoom: coverZoom(item.work, W, H),
+        u: (fb[0] + fb[2]) / 2,
+        v: (fb[1] + fb[3]) / 2,
+      });
+      return;
+    }
+  }
+  item.mode = "fit";
+}
+
 function newItem(file, extra = {}) {
   items.value.push({
     id: nextId++,
@@ -376,11 +409,11 @@ function newItem(file, extra = {}) {
   return items.value[items.value.length - 1];
 }
 
-async function addFiles(fileList) {
+async function addFiles(fileList, extra = {}) {
   const added = [];
   for (const file of Array.from(fileList || [])) {
     if (!file.type.startsWith("image/")) continue;
-    const it = newItem(file);
+    const it = newItem(file, extra);
     added.push(it);
     if (selectedId.value === null) selectedId.value = it.id;
     try {
@@ -398,6 +431,7 @@ async function addFiles(fileList) {
         it.placeFrom = "XMP/IPTC";
       }
       it.work = await decode(file, WORK_MAX_DIM, (w, h) => (it.natural = { w, h }));
+      autoFrame(it);
       it.status = "ready";
       inferPlaces();
       refresh(it);
@@ -425,7 +459,7 @@ watch(importRequest, async (entries) => {
   if (!entries) return;
   importRequest.value = null;
   for (const e of entries) {
-    const [it] = await addFiles([e.file]);
+    const [it] = await addFiles([e.file], e.faceBox ? { faceBox: e.faceBox } : {});
     if (!it) continue;
     if (e.place) it.placeText = e.place;
     if (!it.dateAuto && e.dateFallback) it.dateText = e.dateFallback;
@@ -571,7 +605,7 @@ async function renderForDevice(item) {
   const frame = compose(item, await decode(item.file, 4096));
   // The device gets native panel dimensions; the library rotates the output.
   const out = await dither(
-    "background",
+    "upload",
     `upload:${item.id}`,
     "upload",
     await createImageBitmap(frame),
@@ -604,17 +638,60 @@ async function frameError(resp) {
   return new Error((await resp.text()) || `the frame answered HTTP ${resp.status}`);
 }
 
+const FRAME_TIMEOUT_MS = 60_000;
+const SEND_ATTEMPTS = 3;
+
+// The frame stops answering while it redraws its e-paper (its own schedule
+// can start a refresh mid-batch), so requests to it get a deadline.
+async function frameFetch(url, init = {}, timeoutMs = FRAME_TIMEOUT_MS) {
+  try {
+    return await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+  } catch (e) {
+    if (e.name === "TimeoutError")
+      throw new Error(`the frame did not answer within ${timeoutMs / 1000} s`);
+    throw new Error("the frame is not reachable");
+  }
+}
+
+async function frameHas(album, filename) {
+  try {
+    const resp = await frameFetch(`/api/images?album=${encodeURIComponent(album)}`, {}, 15_000);
+    return resp.ok && (await resp.json()).some((i) => i.filename === filename);
+  } catch {
+    return false;
+  }
+}
+
+// Send with retries. A timed-out request may still have landed, so before a
+// retry the album is checked for the file instead of sending it twice.
+async function sendToFrame(item, album, form, filename) {
+  for (let attempt = 1; ; attempt++) {
+    item.step = attempt === 1 ? "sending" : `sending (try ${attempt} of ${SEND_ATTEMPTS})`;
+    try {
+      const resp = await frameFetch(`/api/upload?album=${encodeURIComponent(album)}`, {
+        method: "POST",
+        body: form,
+      });
+      if (resp.ok) return;
+      throw await frameError(resp);
+    } catch (e) {
+      item.step = "checking whether it arrived";
+      await new Promise((r) => setTimeout(r, 5000));
+      if (await frameHas(album, filename)) return;
+      if (attempt >= SEND_ATTEMPTS) throw new Error(`${e.message} (tried ${attempt} times)`);
+    }
+  }
+}
+
 async function uploadOne(item) {
   item.status = "uploading";
   item.error = null;
   try {
     const album = appStore.selectedAlbum;
+    item.step = "preparing";
     const { form, filename } = await renderForDevice(item);
-    const resp = await fetch(`/api/upload?album=${encodeURIComponent(album)}`, {
-      method: "POST",
-      body: form,
-    });
-    if (!resp.ok) throw await frameError(resp);
+    await sendToFrame(item, album, form, filename);
+    item.step = "saving the original";
     const key = `${album}/${filename}`;
     // The frame has the new picture; replacing the old one and keeping the
     // original are follow-ups that should not undo a successful send.
@@ -625,7 +702,8 @@ async function uploadOne(item) {
       warnings.push(`not editable later: ${e.message}`);
     }
     if (item.replaces && item.replaces !== key) {
-      const del = await fetch("/api/delete", {
+      item.step = "removing the old version";
+      const del = await frameFetch("/api/delete", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ filepath: item.replaces }),
@@ -638,9 +716,11 @@ async function uploadOne(item) {
     }
     item.replaces = key; // sending again replaces this version
     item.status = "done";
+    item.step = null;
     if (warnings.length) item.error = `Sent, but ${warnings.join("; ")}.`;
   } catch (e) {
     item.status = "error";
+    item.step = null;
     item.error = e.message;
   }
 }
@@ -663,14 +743,19 @@ async function showOnFrame(item) {
   }
 }
 
+const sendProgress = ref({ done: 0, total: 0, current: null });
+
 async function uploadAll() {
   await checkFrame();
   if (!frameAwake.value) return;
   uploading.value = true;
+  const queue = pending.value.filter((i) => i.status !== "reading");
+  sendProgress.value = { done: 0, total: queue.length, current: null };
   try {
-    for (const item of pending.value) {
-      if (item.status === "reading") continue;
+    for (const item of queue) {
+      sendProgress.value.current = item;
       await uploadOne(item);
+      sendProgress.value.done++;
       if (item.status === "error") {
         await checkFrame();
         if (!frameAwake.value) break;
@@ -680,6 +765,7 @@ async function uploadAll() {
     await appStore.loadImages(appStore.selectedAlbum);
   } finally {
     uploading.value = false;
+    sendProgress.value.current = null;
   }
 }
 
@@ -697,29 +783,41 @@ function slideTo(event) {
 
 let draggingSlider = false;
 
+let pressStart = null; // where a press on the photo began, until it becomes a drag
+
+// The ↔ handle drags the compare slider. Dragging the photo itself (more than
+// a few pixels, so a plain click does nothing) switches to manual and pans.
 function onPreviewDown(event) {
   event.currentTarget.setPointerCapture(event.pointerId);
-  if (!isManual.value || event.target.closest(".slider-handle")) {
+  if (event.target.closest(".slider-handle")) {
     draggingSlider = true;
     slideTo(event);
-  } else {
+  } else if (isManual.value) {
     onFrameDown(event);
+  } else {
+    pressStart = { x: event.clientX, y: event.clientY };
   }
 }
 
 function onPreviewMove(event) {
-  if (draggingSlider) slideTo(event);
-  else if (isManual.value) onFrameMove(event);
+  if (draggingSlider) return slideTo(event);
+  if (pressStart && Math.hypot(event.clientX - pressStart.x, event.clientY - pressStart.y) > 4) {
+    setMode(selected.value, "manual");
+    pointers.set(event.pointerId, pressStart);
+    pressStart = null;
+  }
+  if (isManual.value) onFrameMove(event);
 }
 
 function onPreviewUp(event) {
   draggingSlider = false;
+  pressStart = null;
   onFrameUp(event);
 }
 
 function onPreviewWheel(event) {
-  if (!isManual.value) return;
   event.preventDefault();
+  if (!isManual.value) setMode(selected.value, "manual");
   onFrameWheel(event);
 }
 
@@ -1025,13 +1123,27 @@ const statusIcon = {
         v-if="items.length"
         color="primary"
         variant="flat"
-        :loading="uploading"
-        :disabled="!pending.length || !frameAwake"
+        :disabled="uploading || !pending.length || !frameAwake"
         @click="uploadAll"
       >
         Send {{ pending.length }} to “{{ appStore.selectedAlbum }}”
       </v-btn>
     </v-card-title>
+
+    <!-- What the send is doing right now: which photo, which step -->
+    <v-sheet v-if="uploading" rounded border class="mx-4 mb-2 pa-3">
+      <div class="d-flex align-center ga-2 mb-2 text-body-2">
+        <v-progress-circular indeterminate size="16" width="2" />
+        <strong>Sending {{ sendProgress.done + 1 }} / {{ sendProgress.total }}</strong>
+        <span class="text-medium-emphasis text-truncate">
+          {{ sendProgress.current?.name }} — {{ sendProgress.current?.step }}
+        </span>
+      </div>
+      <v-progress-linear
+        :model-value="(sendProgress.done / (sendProgress.total || 1)) * 100"
+        rounded
+      />
+    </v-sheet>
 
     <v-card-text>
       <input

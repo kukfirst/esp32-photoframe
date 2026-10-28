@@ -385,9 +385,22 @@ function folderDate(folder) {
   });
 }
 
+// Union of the good faces, normalised: the editor crops around it.
+function faceBox(p) {
+  const good = (p.faces || []).filter(isGoodFace);
+  if (!good.length) return null;
+  return [
+    Math.min(...good.map((f) => f.box[0])),
+    Math.min(...good.map((f) => f.box[1])),
+    Math.max(...good.map((f) => f.box[2])),
+    Math.max(...good.map((f) => f.box[3])),
+  ];
+}
+
 function sendChecked() {
   const entries = checkedPhotos.value.map(({ p, g, f }) => ({
     file: p.file,
+    faceBox: faceBox(p),
     place: photoPlace(p, g).label,
     dateFallback: p.time ? null : folderDate(f),
   }));
