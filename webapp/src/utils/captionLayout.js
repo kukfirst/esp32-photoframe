@@ -2,7 +2,7 @@
 // logical display, the remaining area filled with a blurred copy of the photo,
 // and a date/place caption placed only on that fill area -- never on the photo.
 
-export const MODES = ["fit", "crop"];
+export const MODES = ["fit", "crop", "manual"];
 
 function makeCanvas(w, h) {
   const c = document.createElement("canvas");
@@ -63,15 +63,41 @@ function drawCaption(ctx, box, lines, m) {
   );
 }
 
+// Zoom is relative to "fit" (1 = whole photo visible); this is the zoom at
+// which the photo covers the whole frame.
+export function coverZoom(img, W, H) {
+  return Math.max(W / img.width, H / img.height) / Math.min(W / img.width, H / img.height);
+}
+
+export const MAX_ZOOM = 6;
+
+// Keep the requested view inside sane bounds: zoom in [1, MAX_ZOOM] and the
+// photo centre (u, v, in photo-relative 0..1 units) such that the photo never
+// leaves a gap on a side where it is larger than the frame.
+export function clampView(img, W, H, view) {
+  const fit = Math.min(W / img.width, H / img.height);
+  const zoom = Math.min(MAX_ZOOM, Math.max(1, view.zoom));
+  const sw = img.width * fit * zoom;
+  const sh = img.height * fit * zoom;
+  const clampAxis = (c, size, frame) => {
+    if (size <= frame) return 0.5;
+    const half = frame / 2 / size;
+    return Math.min(1 - half, Math.max(half, c));
+  };
+  return { zoom, u: clampAxis(view.u, sw, W), v: clampAxis(view.v, sh, H) };
+}
+
 /**
  * @param img     decoded image (EXIF orientation already applied by the browser)
  * @param width   logical display width (orientation applied)
  * @param height  logical display height
- * @param mode    "fit" keeps the whole photo, "crop" fills the frame
+ * @param mode    "fit" keeps the whole photo, "crop" fills the frame,
+ *                "manual" uses `view`
+ * @param view    for "manual": { zoom (1 = fit), u, v (photo point at the frame centre) }
  * @param lines   caption lines; empty strings are dropped
  * @returns canvas of exactly width x height
  */
-export function composeFrame(img, { width: W, height: H, mode = "fit", lines = [] }) {
+export function composeFrame(img, { width: W, height: H, mode = "fit", view = null, lines = [] }) {
   const caption = lines.filter(Boolean);
   const m = captionMetrics(H);
   const canvas = makeCanvas(W, H);
@@ -80,50 +106,43 @@ export function composeFrame(img, { width: W, height: H, mode = "fit", lines = [
 
   const pw = img.width;
   const ph = img.height;
-  let box;
-  let capBox = null;
+  const fit = Math.min(W / pw, H / ph);
+  let v = { zoom: 1, u: 0.5, v: 0.5 };
+  if (mode === "crop") v.zoom = coverZoom(img, W, H);
+  if (mode === "manual" && view) v = clampView(img, W, H, view);
 
-  if (mode === "crop") {
-    const areaH = caption.length ? H - m.strip : H;
-    const scale = Math.max(W / pw, areaH / ph);
-    const sw = W / scale;
-    const sh = areaH / scale;
-    ctx.drawImage(img, (pw - sw) / 2, (ph - sh) / 2, sw, sh, 0, 0, W, areaH);
-    if (caption.length) {
-      // A blurred strip under a cropped photo reads as a smear; solid black is
-      // a clean panel ink and the caption plate blends into it.
-      ctx.fillStyle = "#000";
-      ctx.fillRect(0, areaH, W, H - areaH);
-      capBox = [0, areaH, W, H];
+  let scale = fit * v.zoom;
+  let sw = pw * scale;
+  let sh = ph * scale;
+  let x = W / 2 - v.u * sw;
+  let y = H / 2 - v.v * sh;
+
+  let capBox = null;
+  if (caption.length) {
+    const right = W - (x + sw);
+    const bottom = H - (y + sh);
+    if (right >= W * 0.15) {
+      capBox = [x + sw, H - m.strip - m.pad, W, H]; // right bar
+    } else if (bottom >= m.strip) {
+      capBox = [0, y + sh, W, H]; // bottom bar
+    } else if (x >= W * 0.15) {
+      capBox = [0, H - m.strip - m.pad, x, H]; // left bar
+    } else if (mode === "fit") {
+      // Same aspect as the frame: shrink until a bottom strip exists.
+      scale = Math.min(W / pw, (H - m.strip) / ph);
+      sw = pw * scale;
+      sh = ph * scale;
+      x = (W - sw) / 2;
+      y = (H - m.strip - sh) / 2;
+      capBox = [0, H - m.strip, W, H];
+    } else {
+      // The photo covers the frame: a small plate in the corner, over the photo.
+      capBox = [0, 0, W, H];
     }
-  } else {
-    let scale = Math.min(W / pw, H / ph);
-    let sw = Math.round(pw * scale);
-    let sh = Math.round(ph * scale);
-    let side = Math.floor((W - sw) / 2);
-    let top = Math.floor((H - sh) / 2);
-    if (caption.length) {
-      if (side >= W * 0.15) {
-        // Portrait on a landscape frame: bottom of the right bar.
-        capBox = [W - side, H - m.strip - m.pad, W, H];
-      } else if (top >= m.strip) {
-        // Wide photo: the bottom bar.
-        capBox = [0, top + sh, W, H];
-      } else {
-        // Same aspect as the frame: shrink until a bottom strip exists.
-        scale = Math.min(W / pw, (H - m.strip) / ph);
-        sw = Math.round(pw * scale);
-        sh = Math.round(ph * scale);
-        side = Math.floor((W - sw) / 2);
-        top = Math.floor((H - m.strip - sh) / 2);
-        capBox = [0, H - m.strip, W, H];
-      }
-    }
-    box = [side, top, sw, sh];
-    ctx.imageSmoothingQuality = "high";
-    ctx.drawImage(img, ...box);
   }
 
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(img, Math.round(x), Math.round(y), Math.round(sw), Math.round(sh));
   if (capBox) drawCaption(ctx, capBox, caption, m);
   return canvas;
 }

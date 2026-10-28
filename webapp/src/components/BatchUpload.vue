@@ -2,9 +2,9 @@
 // Batch upload with date/place captions (cachypc fork). Each photo is composed
 // into a full frame (photo + blurred fill + caption off the photo), then goes
 // through the same processing and upload path as ImageUpload.vue.
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onMounted, ref, watch } from "vue";
 import { useAppStore, useSettingsStore } from "../stores";
-import { MODES, composeFrame } from "../utils/captionLayout";
+import { MAX_ZOOM, MODES, clampView, composeFrame, coverZoom } from "../utils/captionLayout";
 import {
   collectDates,
   formatDate,
@@ -160,6 +160,12 @@ function effectiveMode(item) {
 }
 
 function setMode(item, mode) {
+  if (mode === "manual" && !item.view && item.work) {
+    // Start manual framing from what the photo looks like now.
+    const { width, height } = frameSize.value;
+    const zoom = effectiveMode(item) === "crop" ? coverZoom(item.work, width, height) : 1;
+    item.view = { zoom, u: 0.5, v: 0.5 };
+  }
   item.mode = mode;
   refresh(item);
 }
@@ -184,6 +190,7 @@ function compose(item, source, scale = 1) {
     width: Math.round(frameSize.value.width * scale),
     height: Math.round(frameSize.value.height * scale),
     mode: effectiveMode(item),
+    view: item.view,
     lines: captionLines(item),
   });
 }
@@ -311,6 +318,7 @@ async function addFiles(fileList) {
       file,
       name: file.name,
       mode: null,
+      view: null,
       params: null,
       preset: null,
       dateAuto: null,
@@ -480,6 +488,90 @@ function onSlideMove(event) {
   if (event.currentTarget.hasPointerCapture(event.pointerId)) slideTo(event);
 }
 
+// ---------- manual framing: drag to pan, wheel / pinch / slider to zoom ----------
+
+const liveCanvas = ref(null);
+const framing = ref(false); // true while the user is moving the photo
+const pointers = new Map();
+let pinchStart = null;
+let framingTimer = null;
+let liveFrame = 0;
+
+const isManual = computed(() => selected.value && effectiveMode(selected.value) === "manual");
+
+// Fast, undithered redraw while framing; the dithered preview follows once
+// the user pauses.
+function drawLive() {
+  cancelAnimationFrame(liveFrame);
+  liveFrame = requestAnimationFrame(() => {
+    const item = selected.value;
+    const canvas = liveCanvas.value;
+    if (!item?.work || !canvas) return;
+    const frame = compose(item, item.work, 0.5);
+    canvas.width = frame.width;
+    canvas.height = frame.height;
+    canvas.getContext("2d").drawImage(frame, 0, 0);
+  });
+}
+
+function updateView(patch) {
+  const item = selected.value;
+  const { width, height } = frameSize.value;
+  item.view = clampView(item.work, width, height, { ...item.view, ...patch });
+  framing.value = true;
+  nextTick(drawLive);
+  clearTimeout(framingTimer);
+  framingTimer = setTimeout(() => {
+    framing.value = false;
+    refresh(item);
+  }, 500);
+}
+
+// Screen pixels -> photo-relative units at the current zoom.
+function photoUnits(rect) {
+  const item = selected.value;
+  const { width, height } = frameSize.value;
+  const fit = Math.min(width / item.work.width, height / item.work.height);
+  const toFrame = width / rect.width;
+  return {
+    du: toFrame / (item.work.width * fit * item.view.zoom),
+    dv: toFrame / (item.work.height * fit * item.view.zoom),
+  };
+}
+
+function onFrameDown(event) {
+  event.currentTarget.setPointerCapture(event.pointerId);
+  pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+  if (pointers.size === 2) {
+    const [a, b] = [...pointers.values()];
+    pinchStart = { dist: Math.hypot(a.x - b.x, a.y - b.y), zoom: selected.value.view.zoom };
+  }
+}
+
+function onFrameMove(event) {
+  const prev = pointers.get(event.pointerId);
+  if (!prev) return;
+  const cur = { x: event.clientX, y: event.clientY };
+  pointers.set(event.pointerId, cur);
+  if (pointers.size === 2 && pinchStart) {
+    const [a, b] = [...pointers.values()];
+    updateView({ zoom: (pinchStart.zoom * Math.hypot(a.x - b.x, a.y - b.y)) / pinchStart.dist });
+    return;
+  }
+  const { du, dv } = photoUnits(event.currentTarget.getBoundingClientRect());
+  const view = selected.value.view;
+  updateView({ u: view.u - (cur.x - prev.x) * du, v: view.v - (cur.y - prev.y) * dv });
+}
+
+function onFrameUp(event) {
+  pointers.delete(event.pointerId);
+  if (pointers.size < 2) pinchStart = null;
+}
+
+function onFrameWheel(event) {
+  updateView({ zoom: selected.value.view.zoom * Math.exp(-event.deltaY * 0.0015) });
+}
+
 const statusIcon = {
   reading: "mdi-timer-sand",
   uploading: "mdi-upload",
@@ -606,6 +698,27 @@ const statusIcon = {
         <v-row v-if="selected">
           <v-col cols="12" md="8">
             <div
+              v-if="isManual"
+              class="compare framing"
+              :style="{ aspectRatio: frameSize.width / frameSize.height }"
+              @pointerdown.prevent="onFrameDown"
+              @pointermove="onFrameMove"
+              @pointerup="onFrameUp"
+              @pointercancel="onFrameUp"
+              @wheel.prevent="onFrameWheel"
+            >
+              <canvas v-show="framing" ref="liveCanvas" class="compare-img" />
+              <img
+                v-if="!framing && preview.processed"
+                :src="preview.processed"
+                alt=""
+                class="compare-img"
+                draggable="false"
+              />
+              <v-progress-linear v-if="preview.busy" indeterminate class="compare-busy" />
+            </div>
+            <div
+              v-else
               class="compare"
               :style="{ aspectRatio: frameSize.width / frameSize.height }"
               @pointerdown.prevent="onSlideStart"
@@ -628,7 +741,21 @@ const statusIcon = {
               </template>
               <v-progress-linear v-if="preview.busy" indeterminate class="compare-busy" />
             </div>
-            <div class="d-flex justify-space-between mt-1">
+            <div v-if="isManual" class="d-flex align-center ga-2 mt-1">
+              <v-icon icon="mdi-magnify-minus-outline" size="small" />
+              <v-slider
+                :model-value="selected.view.zoom"
+                :min="1"
+                :max="MAX_ZOOM"
+                :step="0.01"
+                hide-details
+                density="compact"
+                @update:model-value="updateView({ zoom: $event })"
+              />
+              <v-icon icon="mdi-magnify-plus-outline" size="small" />
+              <span class="text-caption text-grey ml-2">drag to move · wheel or pinch to zoom</span>
+            </div>
+            <div v-else class="d-flex justify-space-between mt-1">
               <span class="text-caption">← Original</span>
               <span class="text-caption">Processed (as on the panel) →</span>
             </div>
@@ -838,6 +965,13 @@ const statusIcon = {
   user-select: none;
   touch-action: pan-y;
   cursor: ew-resize;
+}
+.compare.framing {
+  cursor: grab;
+  touch-action: none;
+}
+.compare.framing:active {
+  cursor: grabbing;
 }
 .compare-img {
   position: absolute;
