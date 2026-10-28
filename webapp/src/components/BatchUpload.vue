@@ -17,6 +17,7 @@ import {
 import ProcessingControls from "./ProcessingControls.vue";
 import { getPresetOptions } from "@aitjcize/epaper-image-convert";
 import { dither } from "../utils/ditherPool";
+import { editRequest } from "../utils/editRequest";
 
 const appStore = useAppStore();
 const settingsStore = useSettingsStore();
@@ -344,34 +345,41 @@ function onPresetChange(preset) {
 
 // ---------- adding photos ----------
 
+function newItem(file, extra = {}) {
+  items.value.push({
+    id: nextId++,
+    file,
+    name: file.name,
+    mode: null,
+    view: null,
+    natural: null,
+    beforeUpscale: null,
+    // Own settings by default; "All photos" switches a photo to the shared ones.
+    params: { ...settingsStore.params },
+    preset: settingsStore.preset,
+    dateAuto: null,
+    dateText: null,
+    gps: null,
+    geocoding: false,
+    placeAuto: null,
+    placeFrom: null,
+    placeText: null,
+    near: null,
+    replaces: null, // frame path this photo replaces when sent (editing from the gallery)
+    status: "reading",
+    error: null,
+    tile: null,
+    work: null,
+    full: null,
+    ...extra,
+  });
+  return items.value[items.value.length - 1];
+}
+
 async function addFiles(fileList) {
   for (const file of Array.from(fileList || [])) {
     if (!file.type.startsWith("image/")) continue;
-    items.value.push({
-      id: nextId++,
-      file,
-      name: file.name,
-      mode: null,
-      view: null,
-      natural: null,
-      // Own settings by default; "All photos" switches a photo to the shared ones.
-      params: { ...settingsStore.params },
-      preset: settingsStore.preset,
-      dateAuto: null,
-      dateText: null,
-      gps: null,
-      geocoding: false,
-      placeAuto: null,
-      placeFrom: null,
-      placeText: null,
-      near: null,
-      status: "reading",
-      error: null,
-      tile: null,
-      work: null,
-      full: null,
-    });
-    const it = items.value[items.value.length - 1];
+    const it = newItem(file);
     if (selectedId.value === null) selectedId.value = it.id;
     try {
       let tags = {};
@@ -407,6 +415,98 @@ async function addFiles(fileList) {
     }
   }
 }
+
+// ---------- library of originals (cachypc/upscale/server.py) ----------
+
+const libraryUrl = (what, key) => `/library/${what}?key=${encodeURIComponent(key)}`;
+
+// Everything needed to rebuild the photo in the editor later.
+function editState(item) {
+  return {
+    name: item.name,
+    mode: item.mode,
+    view: item.view,
+    params: item.params,
+    preset: item.preset,
+    caption: showCaption.value,
+    dateAuto: item.dateAuto && {
+      source: item.dateAuto.source,
+      value: item.dateAuto.value.toISOString(),
+    },
+    dateText: item.dateText,
+    gps: item.gps,
+    placeAuto: item.placeAuto,
+    placeFrom: item.placeFrom,
+    placeText: item.placeText ?? (item.near?.auto ? item.near.place : null),
+    savedAt: new Date().toISOString(),
+  };
+}
+
+async function libraryFetch(url, init) {
+  try {
+    return await fetch(url, init);
+  } catch {
+    throw new Error("The cachypc helper service is not reachable (cachypc/upscale/server.py).");
+  }
+}
+
+async function saveToLibrary(key, item) {
+  const put = (what, body, type) =>
+    libraryFetch(libraryUrl(what, key), { method: "PUT", headers: { "Content-Type": type }, body });
+  const r1 = await put("source", item.file, item.file.type || "application/octet-stream");
+  const r2 = await put("meta", JSON.stringify(plain(editState(item))), "application/json");
+  if (!r1.ok || !r2.ok) throw new Error("the original could not be saved for later editing");
+}
+
+async function openFromGallery({ album, filename }) {
+  const key = `${album}/${filename}`;
+  const existing = items.value.find((i) => i.replaces === key);
+  if (existing) return select(existing);
+  try {
+    const metaResp = await libraryFetch(libraryUrl("meta", key));
+    if (metaResp.status === 404) {
+      throw new Error(
+        "No original is stored for this photo: it was uploaded before the library existed " +
+          "or from another device. Add the original photo again to change it."
+      );
+    }
+    if (!metaResp.ok) throw new Error(`library answered HTTP ${metaResp.status}`);
+    const meta = await metaResp.json();
+    const srcResp = await libraryFetch(libraryUrl("source", key));
+    if (!srcResp.ok) throw new Error(`the stored original is missing (HTTP ${srcResp.status})`);
+    const blob = await srcResp.blob();
+    const file = new File([blob], meta.name, { type: blob.type });
+    const caption = meta.caption !== false;
+    const it = newItem(file, {
+      mode: meta.mode,
+      view: meta.view,
+      params: meta.params,
+      preset: meta.preset,
+      dateAuto: meta.dateAuto && {
+        source: meta.dateAuto.source,
+        value: new Date(meta.dateAuto.value),
+      },
+      dateText: caption ? meta.dateText : "",
+      gps: meta.gps,
+      placeAuto: meta.placeAuto,
+      placeFrom: meta.placeFrom,
+      placeText: caption ? meta.placeText : "",
+      replaces: key,
+    });
+    it.work = await decode(file, WORK_MAX_DIM, (w, h) => (it.natural = { w, h }));
+    it.status = "ready";
+    select(it);
+    refresh(it);
+  } catch (e) {
+    notify(`Cannot edit ${filename}: ${e.message}`, "error");
+  }
+}
+
+watch(editRequest, (req) => {
+  if (!req) return;
+  editRequest.value = null;
+  openFromGallery(req);
+});
 
 function onFiles(event) {
   addFiles(event.target.files);
@@ -448,49 +548,100 @@ function baseName(file) {
   return (fnv >>> 0).toString(16).padStart(8, "0") + Date.now().toString(36).slice(-4);
 }
 
+// Render the device frame: EPDGZ plus a JPEG thumbnail, as ImageUpload.vue does.
+async function renderForDevice(item) {
+  const frame = compose(item, await decode(item.file, 4096));
+  // The device gets native panel dimensions; the library rotates the output.
+  const out = await dither(
+    "background",
+    `upload:${item.id}`,
+    "upload",
+    await createImageBitmap(frame),
+    {
+      displayWidth: appStore.systemInfo.width,
+      displayHeight: appStore.systemInfo.height,
+      palette: palette(),
+      params: plain(itemParams(item)),
+      orientation: settingsStore.appliedOrientation,
+      scaleMode: "cover",
+      usePerceivedOutput: false,
+      grayscale: appStore.isGrayscale,
+    }
+  );
+  const layout = document.createElement("canvas");
+  layout.width = out.original.width;
+  layout.height = out.original.height;
+  layout.getContext("2d").drawImage(out.original, 0, 0);
+  out.original.close();
+  const thumbCanvas = imageProcessor.generateThumbnail(layout, THUMBNAIL_MAX_DIM);
+  const thumbBlob = await new Promise((r) => thumbCanvas.toBlob(r, "image/jpeg", 0.85));
+  const name = baseName(item.file);
+  const form = new FormData();
+  form.append("image", new Blob([out.epdgz], { type: "application/gzip" }), `${name}.epdgz`);
+  form.append("thumbnail", thumbBlob, `${name}.jpg`);
+  return { form, filename: `${name}.epdgz` };
+}
+
+async function frameError(resp) {
+  return new Error((await resp.text()) || `the frame answered HTTP ${resp.status}`);
+}
+
 async function uploadOne(item) {
   item.status = "uploading";
   item.error = null;
   try {
-    const frame = compose(item, await decode(item.file, 4096));
-    // The device gets native panel dimensions; the library rotates the output.
-    const out = await dither(
-      "background",
-      `upload:${item.id}`,
-      "upload",
-      await createImageBitmap(frame),
-      {
-        displayWidth: appStore.systemInfo.width,
-        displayHeight: appStore.systemInfo.height,
-        palette: palette(),
-        params: plain(itemParams(item)),
-        orientation: settingsStore.appliedOrientation,
-        scaleMode: "cover",
-        usePerceivedOutput: false,
-        grayscale: appStore.isGrayscale,
-      }
-    );
-    const gz = out.epdgz;
-    const layout = document.createElement("canvas");
-    layout.width = out.original.width;
-    layout.height = out.original.height;
-    layout.getContext("2d").drawImage(out.original, 0, 0);
-    out.original.close();
-    const thumbCanvas = imageProcessor.generateThumbnail(layout, THUMBNAIL_MAX_DIM);
-    const thumbBlob = await new Promise((r) => thumbCanvas.toBlob(r, "image/jpeg", 0.85));
-    const name = baseName(item.file);
-    const form = new FormData();
-    form.append("image", new Blob([gz], { type: "application/gzip" }), `${name}.epdgz`);
-    form.append("thumbnail", thumbBlob, `${name}.jpg`);
-    const resp = await fetch(`/api/upload?album=${encodeURIComponent(appStore.selectedAlbum)}`, {
+    const album = appStore.selectedAlbum;
+    const { form, filename } = await renderForDevice(item);
+    const resp = await fetch(`/api/upload?album=${encodeURIComponent(album)}`, {
       method: "POST",
       body: form,
     });
-    if (!resp.ok) throw new Error((await resp.text()) || `HTTP ${resp.status}`);
+    if (!resp.ok) throw await frameError(resp);
+    const key = `${album}/${filename}`;
+    // The frame has the new picture; replacing the old one and keeping the
+    // original are follow-ups that should not undo a successful send.
+    const warnings = [];
+    try {
+      await saveToLibrary(key, item);
+    } catch (e) {
+      warnings.push(`not editable later: ${e.message}`);
+    }
+    if (item.replaces && item.replaces !== key) {
+      const del = await fetch("/api/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filepath: item.replaces }),
+      }).catch(() => null);
+      if (del?.ok)
+        await libraryFetch(libraryUrl("item", item.replaces), { method: "DELETE" }).catch(
+          () => null
+        );
+      else warnings.push(`the old version ${item.replaces} is still on the frame`);
+    }
+    item.replaces = key; // sending again replaces this version
     item.status = "done";
+    if (warnings.length) item.error = `Sent, but ${warnings.join("; ")}.`;
   } catch (e) {
     item.status = "error";
     item.error = e.message;
+  }
+}
+
+// Show the selected photo on the frame now, without saving it to an album.
+const showing = ref(false);
+async function showOnFrame(item) {
+  await checkFrame();
+  if (!frameAwake.value) return notify("The frame is asleep: press its button first.", "warning");
+  showing.value = true;
+  try {
+    const { form } = await renderForDevice(item);
+    const resp = await fetch("/api/display-image", { method: "POST", body: form });
+    if (!resp.ok) throw await frameError(resp);
+    notify("Shown on the frame (not saved to an album)", "success");
+  } catch (e) {
+    notify(`Could not show it: ${e.message}`, "error");
+  } finally {
+    showing.value = false;
   }
 }
 
@@ -580,6 +731,96 @@ const upscale = computed(() => {
         : 1;
   return Math.min(width / w, height / h) * zoom;
 });
+
+// ---------- AI upscale of the visible part (cachypc/upscale/server.py) ----------
+
+const UPSCALE_FROM = 1.5; // offer it only when the photo is stretched more than this
+const upscaling = ref(false);
+const upscaleError = ref(null);
+
+// The part of the photo that is visible in the frame, in source pixels.
+function visibleRegion(item) {
+  const { width: W, height: H } = frameSize.value;
+  const { w, h } = item.natural;
+  const mode = effectiveMode(item);
+  const view =
+    mode === "manual"
+      ? clampView(item.work, W, H, item.view)
+      : { zoom: mode === "crop" ? coverZoom(item.work, W, H) : 1, u: 0.5, v: 0.5 };
+  const scale = Math.min(W / w, H / h) * view.zoom; // frame px per source px
+  const x = W / 2 - view.u * w * scale;
+  const y = H / 2 - view.v * h * scale;
+  const x0 = Math.max(0, -x / scale);
+  const y0 = Math.max(0, -y / scale);
+  const x1 = Math.min(w, (W - x) / scale);
+  const y1 = Math.min(h, (H - y) / scale);
+  return { x: Math.floor(x0), y: Math.floor(y0), w: Math.ceil(x1 - x0), h: Math.ceil(y1 - y0) };
+}
+
+async function aiUpscale(item) {
+  upscaling.value = true;
+  upscaleError.value = null;
+  try {
+    const r = visibleRegion(item);
+    const src = await createImageBitmap(item.file, { imageOrientation: "from-image" });
+    const crop = document.createElement("canvas");
+    crop.width = r.w;
+    crop.height = r.h;
+    crop.getContext("2d").drawImage(src, r.x, r.y, r.w, r.h, 0, 0, r.w, r.h);
+    src.close();
+    const body = await new Promise((res) => crop.toBlob(res, "image/png"));
+    let resp;
+    try {
+      resp = await fetch("/upscale", { method: "POST", body });
+    } catch {
+      // The preview proxy drops the connection when nothing listens on 18087.
+      throw new Error(
+        "The upscale service on cachypc is not reachable. Start it: " +
+          "python3 ~/development/esp32-photoframe/cachypc/upscale/server.py"
+      );
+    }
+    if (!resp.ok) {
+      let message = `HTTP ${resp.status}`;
+      try {
+        message = (await resp.json()).error || message;
+      } catch {
+        message = `The upscale service answered HTTP ${resp.status} without details.`;
+      }
+      throw new Error(message);
+    }
+    const blob = await resp.blob();
+    // The upscaled region becomes the photo; keep what is needed to undo.
+    item.beforeUpscale ??= { file: item.file, mode: item.mode, view: item.view };
+    item.file = new File([blob], item.name.replace(/\.[^.]+$/, "") + "-upscaled.png", {
+      type: "image/png",
+    });
+    item.full = null;
+    item.work = await decode(item.file, WORK_MAX_DIM, (w, h) => (item.natural = { w, h }));
+    item.mode = "manual";
+    item.view = { zoom: 1, u: 0.5, v: 0.5 };
+    refresh(item);
+    notify(`AI upscale done: ${r.w}×${r.h} → ${r.w * 4}×${r.h * 4}`, "success");
+  } catch (e) {
+    upscaleError.value = e.message;
+  } finally {
+    upscaling.value = false;
+  }
+}
+
+async function undoUpscale(item) {
+  const b = item.beforeUpscale;
+  if (!b) return;
+  item.file = b.file;
+  item.mode = b.mode;
+  item.view = b.view;
+  item.beforeUpscale = null;
+  item.full = null;
+  item.work = await decode(item.file, WORK_MAX_DIM, (w, h) => (item.natural = { w, h }));
+  upscaleError.value = null;
+  refresh(item);
+}
+
+watch(selectedId, () => (upscaleError.value = null));
 
 const isManual = computed(() => selected.value && effectiveMode(selected.value) === "manual");
 
@@ -922,12 +1163,26 @@ const statusIcon = {
               }}</span>
               <v-spacer />
               <v-btn
+                size="small"
+                variant="tonal"
+                prepend-icon="mdi-monitor-eye"
+                :loading="showing"
+                :disabled="!frameAwake || selected.status === 'reading'"
+                title="Show this photo on the frame now, without saving it to an album"
+                @click="showOnFrame(selected)"
+              >
+                Show
+              </v-btn>
+              <v-btn
                 icon="mdi-delete"
                 size="small"
                 variant="text"
                 :disabled="selected.status === 'uploading'"
                 @click="remove(selected)"
               />
+            </div>
+            <div v-if="selected.replaces" class="text-caption text-medium-emphasis mb-2">
+              Editing {{ selected.replaces }} — sending replaces it on the frame.
             </div>
             <div v-if="selected.error" class="text-caption text-error mb-2">
               {{ selected.error }}
@@ -1028,6 +1283,43 @@ const statusIcon = {
                 stretched ×{{ upscale.toFixed(1) }}
               </v-chip>
             </div>
+            <div
+              v-if="upscale > UPSCALE_FROM || selected.beforeUpscale"
+              class="d-flex align-center flex-wrap ga-2 mt-2"
+            >
+              <v-btn
+                v-if="upscale > UPSCALE_FROM"
+                size="small"
+                variant="tonal"
+                prepend-icon="mdi-auto-fix"
+                :loading="upscaling"
+                title="4x-UltraSharp on the cachypc GPU, only the visible part"
+                @click="aiUpscale(selected)"
+              >
+                AI upscale
+              </v-btn>
+              <v-btn
+                v-if="selected.beforeUpscale"
+                size="small"
+                variant="text"
+                prepend-icon="mdi-undo"
+                :disabled="upscaling"
+                @click="undoUpscale(selected)"
+              >
+                Undo upscale
+              </v-btn>
+            </div>
+            <v-alert
+              v-if="upscaleError"
+              type="error"
+              variant="tonal"
+              density="compact"
+              class="mt-2 text-body-2"
+              closable
+              title="AI upscale not done"
+              :text="upscaleError"
+              @click:close="upscaleError = null"
+            />
 
             <div class="d-flex align-center mt-4 mb-1">
               <span class="text-caption text-medium-emphasis">Look</span>

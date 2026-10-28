@@ -11,8 +11,14 @@ const BatchUpload = CACHYPC
   ? defineAsyncComponent(() => import("../components/BatchUpload.vue"))
   : null;
 const pageTab = ref("photos");
+
+function editFromGallery(image) {
+  editRequest.value = { album: image.album, filename: image.filename };
+  pageTab.value = "photos";
+}
 import SettingsPanel from "../components/SettingsPanel.vue";
 import OtaUpdate from "../components/OtaUpdate.vue";
+import { editRequest } from "../utils/editRequest";
 
 const appStore = useAppStore();
 const settingsStore = useSettingsStore();
@@ -136,12 +142,17 @@ onUnmounted(() => {
         <template v-if="CACHYPC">
           <v-tabs v-model="pageTab" color="primary" class="mb-4">
             <v-tab value="photos" prepend-icon="mdi-image-multiple">Photos</v-tab>
+            <v-tab value="gallery" prepend-icon="mdi-view-grid">Gallery</v-tab>
             <v-tab value="settings" prepend-icon="mdi-cog">Settings</v-tab>
           </v-tabs>
           <div v-show="pageTab === 'photos'">
-            <BatchUpload class="mb-6" />
+            <BatchUpload />
+          </div>
+          <div v-show="pageTab === 'gallery'">
             <AlbumGallery
               v-if="appStore.systemInfo.sdcard_inserted || appStore.systemInfo.has_flash_storage"
+              editable
+              @edit="editFromGallery"
             />
           </div>
           <div v-show="pageTab === 'settings'">

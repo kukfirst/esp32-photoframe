@@ -7,7 +7,12 @@ import vuetify from "vite-plugin-vuetify";
 import { resolve } from "path";
 
 const frame = process.env.FRAME_URL || "http://192.168.1.131";
-const proxy = { "/api": { target: frame, changeOrigin: true } };
+const upscale = process.env.UPSCALE_URL || "http://127.0.0.1:18087";
+const proxy = {
+  "/api": { target: frame, changeOrigin: true },
+  "/upscale": { target: upscale, changeOrigin: true, timeout: 200000, proxyTimeout: 200000 },
+  "/library": { target: upscale, changeOrigin: true },
+};
 
 export default defineConfig({
   define: { "import.meta.env.VITE_CACHYPC": "true" },

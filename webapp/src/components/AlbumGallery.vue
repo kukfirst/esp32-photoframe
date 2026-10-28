@@ -4,6 +4,10 @@ import { useAppStore } from "../stores";
 
 const appStore = useAppStore();
 
+// cachypc fork: an Edit button that opens the photo in the batch editor.
+defineProps({ editable: { type: Boolean, default: false } });
+const emit = defineEmits(["edit"]);
+
 const newAlbumDialog = ref(false);
 const newAlbumName = ref("");
 const deleteAlbumDialog = ref(false);
@@ -173,6 +177,16 @@ function getThumbnailUrl(image) {
               </div>
               <div class="delete-hotspot">
                 <v-btn
+                  v-if="editable"
+                  icon="mdi-pencil"
+                  size="x-small"
+                  color="primary"
+                  class="edit-overlay"
+                  title="Edit (framing, caption, look)"
+                  aria-label="Edit image"
+                  @click.stop="emit('edit', image)"
+                />
+                <v-btn
                   icon="mdi-delete"
                   size="x-small"
                   color="error"
@@ -327,6 +341,24 @@ function getThumbnailUrl(image) {
   right: 4px;
   opacity: 0;
   transition: opacity 0.2s;
+}
+.edit-overlay {
+  position: absolute;
+  top: 4px;
+  right: 40px;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+.image-card:hover .edit-overlay,
+.image-card:focus-within .edit-overlay,
+.edit-overlay:focus-visible {
+  opacity: 1;
+}
+@media (hover: none) {
+  .image-card .edit-overlay {
+    opacity: 0.92;
+    right: 44px;
+  }
 }
 /* Reveal the button as soon as the thumbnail itself is hovered or focused,
    not only its top-right corner (which nobody found). */
