@@ -15,6 +15,7 @@ import {
   textPlaceFromTags,
 } from "../utils/photoMeta";
 import ProcessingControls from "./ProcessingControls.vue";
+import { dither } from "../utils/ditherPool";
 
 const appStore = useAppStore();
 const settingsStore = useSettingsStore();
@@ -170,19 +171,24 @@ function setMode(item, mode) {
   refresh(item);
 }
 
+// Plain copies: reactive proxies cannot be posted to a worker.
+const plain = (v) => JSON.parse(JSON.stringify(v));
+
 function palette() {
   if (appStore.isGrayscale) {
-    return imageProcessor.makeGrayscale16({
-      blackY: settingsStore.palette?.black_y ?? 0.009,
-      whiteY: settingsStore.palette?.white_y ?? 0.65,
-      gamma: settingsStore.palette?.gamma ?? 1.42,
-    });
+    return plain(
+      imageProcessor.makeGrayscale16({
+        blackY: settingsStore.palette?.black_y ?? 0.009,
+        whiteY: settingsStore.palette?.white_y ?? 0.65,
+        gamma: settingsStore.palette?.gamma ?? 1.42,
+      })
+    );
   }
   const p = settingsStore.palette;
-  return {
+  return plain({
     ...imageProcessor.SPECTRA6,
     perceived: p && Object.keys(p).length ? p : imageProcessor.SPECTRA6.perceived,
-  };
+  });
 }
 
 function compose(item, source, scale = 1) {
@@ -195,53 +201,64 @@ function compose(item, source, scale = 1) {
   });
 }
 
-function processPerceived(item, frame) {
-  return imageProcessor.processImage(frame, {
+function perceivedOptions(item, frame) {
+  return {
     displayWidth: frame.width,
     displayHeight: frame.height,
     palette: palette(),
-    params: { ...itemParams(item) },
+    params: plain(itemParams(item)),
     orientation: null,
     scaleMode: "cover", // the frame already has the display aspect
     usePerceivedOutput: true,
-  });
+  };
 }
 
-// Renders run one at a time so the page stays responsive; a newer request for
-// the same target supersedes an older queued one.
-let renderChain = Promise.resolve();
-const idle = () => new Promise((r) => setTimeout(r, 0));
+function swapUrl(target, key, blob) {
+  if (target[key]) URL.revokeObjectURL(target[key]);
+  target[key] = URL.createObjectURL(blob);
+}
 
-function renderTile(item) {
-  if (!item.work) return;
-  const token = (item.tileToken = (item.tileToken || 0) + 1);
-  renderChain = renderChain.then(async () => {
-    if (token !== item.tileToken || !imageProcessor) return;
-    await idle();
-    const result = processPerceived(item, compose(item, item.work, TILE_SCALE));
-    if (token === item.tileToken) item.tile = result.canvas.toDataURL("image/png");
-  });
+// Dithering runs in workers (utils/ditherPool.js); only composition, which
+// takes tens of milliseconds, stays on the page.
+async function renderTile(item) {
+  if (!item.work || !imageProcessor) return;
+  const frame = compose(item, item.work, TILE_SCALE);
+  const bitmap = await createImageBitmap(frame);
+  const out = await dither(
+    "background",
+    `tile:${item.id}`,
+    "preview",
+    bitmap,
+    perceivedOptions(item, frame)
+  ).catch(() => ({ stale: true }));
+  if (!out.stale) swapUrl(item, "tile", out.blob);
 }
 
 let previewToken = 0;
-function renderPreview() {
+async function renderPreview() {
   const item = selected.value;
-  if (!item || !item.work) return;
+  if (!item || !item.work || !imageProcessor) return;
   const token = ++previewToken;
   preview.value.busy = true;
-  renderChain = renderChain.then(async () => {
-    if (token !== previewToken || !imageProcessor) return;
-    await idle();
-    item.full ??= await decode(item.file, 4096);
-    const frame = compose(item, item.full);
-    const result = processPerceived(item, frame);
-    if (token !== previewToken) return;
-    preview.value = {
-      original: frame.toDataURL("image/jpeg", 0.9),
-      processed: result.canvas.toDataURL("image/png"),
-      busy: false,
-    };
-  });
+  item.full ??= await decode(item.file, 4096);
+  if (token !== previewToken) return;
+  const frame = compose(item, item.full);
+  // The original side updates at once; the processed side when the worker is done.
+  frame.toBlob(
+    (blob) => token === previewToken && swapUrl(preview.value, "original", blob),
+    "image/jpeg",
+    0.9
+  );
+  const out = await dither(
+    "preview",
+    "preview",
+    "preview",
+    await createImageBitmap(frame),
+    perceivedOptions(item, frame)
+  ).catch(() => ({ stale: true }));
+  if (out.stale || token !== previewToken) return;
+  swapUrl(preview.value, "processed", out.blob);
+  preview.value.busy = false;
 }
 
 function refresh(item) {
@@ -332,7 +349,6 @@ async function addFiles(fileList) {
       status: "reading",
       error: null,
       tile: null,
-      tileToken: 0,
       work: null,
       full: null,
     });
@@ -419,17 +435,29 @@ async function uploadOne(item) {
   try {
     const frame = compose(item, await decode(item.file, 4096));
     // The device gets native panel dimensions; the library rotates the output.
-    const result = imageProcessor.processImage(frame, {
-      displayWidth: appStore.systemInfo.width,
-      displayHeight: appStore.systemInfo.height,
-      palette: palette(),
-      params: { ...itemParams(item) },
-      orientation: settingsStore.appliedOrientation,
-      scaleMode: "cover",
-      usePerceivedOutput: false,
-    });
-    const gz = await imageProcessor.createEPDGZ(result.canvas, { grayscale: appStore.isGrayscale });
-    const thumbCanvas = imageProcessor.generateThumbnail(result.originalCanvas, THUMBNAIL_MAX_DIM);
+    const out = await dither(
+      "background",
+      `upload:${item.id}`,
+      "upload",
+      await createImageBitmap(frame),
+      {
+        displayWidth: appStore.systemInfo.width,
+        displayHeight: appStore.systemInfo.height,
+        palette: palette(),
+        params: plain(itemParams(item)),
+        orientation: settingsStore.appliedOrientation,
+        scaleMode: "cover",
+        usePerceivedOutput: false,
+        grayscale: appStore.isGrayscale,
+      }
+    );
+    const gz = out.epdgz;
+    const layout = document.createElement("canvas");
+    layout.width = out.original.width;
+    layout.height = out.original.height;
+    layout.getContext("2d").drawImage(out.original, 0, 0);
+    out.original.close();
+    const thumbCanvas = imageProcessor.generateThumbnail(layout, THUMBNAIL_MAX_DIM);
     const thumbBlob = await new Promise((r) => thumbCanvas.toBlob(r, "image/jpeg", 0.85));
     const name = baseName(item.file);
     const form = new FormData();

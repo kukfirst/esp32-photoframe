@@ -10,6 +10,8 @@ const frame = process.env.FRAME_URL || "http://192.168.1.131";
 const proxy = { "/api": { target: frame, changeOrigin: true } };
 
 export default defineConfig({
+  define: { "import.meta.env.VITE_CACHYPC": "true" },
+  worker: { format: "es" },
   plugins: [
     vue(),
     vuetify({ autoImport: true, styles: { configFile: "src/styles/settings.scss" } }),

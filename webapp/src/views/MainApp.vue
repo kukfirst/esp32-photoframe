@@ -1,10 +1,14 @@
 <script setup>
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, defineAsyncComponent, onMounted, onUnmounted, ref } from "vue";
 import { useAppStore, useSettingsStore } from "../stores";
 import AppHeader from "../components/AppHeader.vue";
 import AlbumGallery from "../components/AlbumGallery.vue";
 import ImageUpload from "../components/ImageUpload.vue";
-import BatchUpload from "../components/BatchUpload.vue";
+// cachypc fork: only the PC-hosted build has the batch uploader (its worker is
+// not among the files the firmware embeds).
+const BatchUpload = import.meta.env.VITE_CACHYPC
+  ? defineAsyncComponent(() => import("../components/BatchUpload.vue"))
+  : null;
 import SettingsPanel from "../components/SettingsPanel.vue";
 import OtaUpdate from "../components/OtaUpdate.vue";
 
@@ -125,7 +129,7 @@ onUnmounted(() => {
           text="This device supports an SD card. To upload images and create multiple albums, please insert one and restart the device."
         ></v-alert>
 
-        <BatchUpload class="mb-6" />
+        <BatchUpload v-if="BatchUpload" class="mb-6" />
 
         <AlbumGallery
           v-if="appStore.systemInfo.sdcard_inserted || appStore.systemInfo.has_flash_storage"
