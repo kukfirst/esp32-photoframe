@@ -39,6 +39,15 @@ export const useAppStore = defineStore("app", () => {
   // API base URL (empty for same-origin)
   const API_BASE = "";
 
+  // PHOTOFRAME-001: the frame's album scan (and anything else SD-backed) can stop
+  // answering forever, and a pending fetch pins the page forever — Chrome only
+  // allows six connections per origin, so the whole tab queues behind it. Every
+  // call to the frame gets a deadline; callers already treat failure as
+  // "standalone mode" / "asleep".
+  const FRAME_TIMEOUT_MS = 30_000;
+  const frameFetch = (url, init = {}) =>
+    fetch(url, { ...init, signal: AbortSignal.timeout(FRAME_TIMEOUT_MS) });
+
   // Getters
   const sortedAlbums = computed(() => {
     return [...albums.value].sort((a, b) => {
@@ -57,7 +66,7 @@ export const useAppStore = defineStore("app", () => {
   // Actions
   async function loadBatteryStatus() {
     try {
-      const response = await fetch(`${API_BASE}/api/battery`);
+      const response = await frameFetch(`${API_BASE}/api/battery`);
       if (!response.ok || response.headers.get("content-type")?.includes("text/html")) {
         return;
       }
@@ -80,7 +89,7 @@ export const useAppStore = defineStore("app", () => {
         albums.value = [{ name: "Default", enabled: true, image_count: 0 }];
         return;
       }
-      const response = await fetch(`${API_BASE}/api/albums`);
+      const response = await frameFetch(`${API_BASE}/api/albums`);
       if (!response.ok || response.headers.get("content-type")?.includes("text/html")) {
         albums.value = [{ name: "Default", enabled: true, image_count: 0 }];
         return;
@@ -101,7 +110,9 @@ export const useAppStore = defineStore("app", () => {
         images.value = [];
         return;
       }
-      const response = await fetch(`${API_BASE}/api/images?album=${encodeURIComponent(albumName)}`);
+      const response = await frameFetch(
+        `${API_BASE}/api/images?album=${encodeURIComponent(albumName)}`
+      );
       if (!response.ok || response.headers.get("content-type")?.includes("text/html")) {
         images.value = [];
         return;
@@ -122,7 +133,7 @@ export const useAppStore = defineStore("app", () => {
 
   async function toggleAlbumEnabled(albumName, enabled) {
     try {
-      const response = await fetch(
+      const response = await frameFetch(
         `${API_BASE}/api/albums/enabled?name=${encodeURIComponent(albumName)}`,
         {
           method: "PUT",
@@ -140,7 +151,7 @@ export const useAppStore = defineStore("app", () => {
 
   async function createAlbum(name) {
     try {
-      const response = await fetch(`${API_BASE}/api/albums`, {
+      const response = await frameFetch(`${API_BASE}/api/albums`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: name.trim() }),
@@ -158,9 +169,12 @@ export const useAppStore = defineStore("app", () => {
 
   async function deleteAlbum(albumName) {
     try {
-      const response = await fetch(`${API_BASE}/api/albums?name=${encodeURIComponent(albumName)}`, {
-        method: "DELETE",
-      });
+      const response = await frameFetch(
+        `${API_BASE}/api/albums?name=${encodeURIComponent(albumName)}`,
+        {
+          method: "DELETE",
+        }
+      );
       if (response.ok) {
         await loadAlbums();
         await loadSystemInfo();
@@ -179,7 +193,7 @@ export const useAppStore = defineStore("app", () => {
   async function deleteImage(album, filename) {
     try {
       const fullPath = `${album}/${filename}`;
-      const response = await fetch(`${API_BASE}/api/delete`, {
+      const response = await frameFetch(`${API_BASE}/api/delete`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ filepath: fullPath }),
@@ -199,7 +213,7 @@ export const useAppStore = defineStore("app", () => {
   async function displayImage(album, filename) {
     try {
       const fullPath = `${album}/${filename}`;
-      const response = await fetch(`${API_BASE}/api/display`, {
+      const response = await frameFetch(`${API_BASE}/api/display`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ filepath: fullPath }),
@@ -213,7 +227,7 @@ export const useAppStore = defineStore("app", () => {
 
   async function enterSleep() {
     try {
-      const response = await fetch(`${API_BASE}/api/sleep`, { method: "POST" });
+      const response = await frameFetch(`${API_BASE}/api/sleep`, { method: "POST" });
       return response.ok;
     } catch (error) {
       console.error("Failed to enter sleep:", error);
@@ -223,7 +237,7 @@ export const useAppStore = defineStore("app", () => {
 
   async function rotateNow() {
     try {
-      const response = await fetch(`${API_BASE}/api/rotate`, { method: "POST" });
+      const response = await frameFetch(`${API_BASE}/api/rotate`, { method: "POST" });
       return response.ok;
     } catch (error) {
       console.error("Failed to rotate:", error);
@@ -233,7 +247,7 @@ export const useAppStore = defineStore("app", () => {
 
   async function keepAlive() {
     try {
-      const response = await fetch(`${API_BASE}/api/keep_alive`, { method: "POST" });
+      const response = await frameFetch(`${API_BASE}/api/keep_alive`, { method: "POST" });
       return response.ok;
     } catch (error) {
       console.error("Failed to send keep-alive:", error);
@@ -244,7 +258,7 @@ export const useAppStore = defineStore("app", () => {
   async function loadSystemInfo() {
     loading.value.systemInfo = true;
     try {
-      const response = await fetch(`${API_BASE}/api/system-info`);
+      const response = await frameFetch(`${API_BASE}/api/system-info`);
       if (response.ok) {
         systemInfo.value = await response.json();
       }

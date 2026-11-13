@@ -27,7 +27,11 @@ function copyOrt(outDir) {
 const frame = process.env.FRAME_URL || "http://192.168.1.131";
 const upscale = process.env.UPSCALE_URL || "http://127.0.0.1:18087";
 const proxy = {
-  "/api": { target: frame, changeOrigin: true },
+  // PHOTOFRAME-001: no timeout here meant a frame that vanishes mid-request kept
+  // the socket open forever (12 wedged sockets seen), and the ESP32's small
+  // httpd socket budget then blocked every later proxied request — while a
+  // direct curl to the frame still worked.
+  "/api": { target: frame, changeOrigin: true, timeout: 30000, proxyTimeout: 30000 },
   "/upscale": { target: upscale, changeOrigin: true, timeout: 200000, proxyTimeout: 200000 },
   "/library": { target: upscale, changeOrigin: true },
   "/sortdata": { target: upscale, changeOrigin: true },

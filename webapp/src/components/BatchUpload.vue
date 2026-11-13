@@ -733,7 +733,7 @@ async function showOnFrame(item) {
   showing.value = true;
   try {
     const { form } = await renderForDevice(item);
-    const resp = await fetch("/api/display-image", { method: "POST", body: form });
+    const resp = await frameFetch("/api/display-image", { method: "POST", body: form });
     if (!resp.ok) throw await frameError(resp);
     notify("Shown on the frame (not saved to an album)", "success");
   } catch (e) {
@@ -761,12 +761,16 @@ async function uploadAll() {
         if (!frameAwake.value) break;
       }
     }
-    await appStore.loadSystemInfo();
-    await appStore.loadImages(appStore.selectedAlbum);
   } finally {
     uploading.value = false;
     sendProgress.value.current = null;
   }
+  // PHOTOFRAME-001: the album refresh is a follow-up, never part of the send.
+  // Awaiting it here meant a frame that stops answering pinned `uploading`
+  // forever: the "Sending N / M" spinner spun on and Send stayed disabled.
+  // The store's calls now time out on their own.
+  appStore.loadSystemInfo();
+  appStore.loadImages(appStore.selectedAlbum);
 }
 
 // ---------- compare slider (same interaction as ImageProcessing.vue) ----------
