@@ -58,7 +58,10 @@ const deviceAsleep = ref(false);
 const wakeupKeyName = computed(() => appStore.systemInfo.wakeup_key_name || "wake button");
 
 async function pingKeepAlive() {
-  const alive = await appStore.keepAlive();
+  // PHOTOFRAME-001: one endpoint failing must not freeze the UI. keep_alive can
+  // fail on its own (older firmware, a rejected call) while the frame is very
+  // much awake, and this dialog used to be persistent with no way out.
+  const alive = (await appStore.keepAlive()) || (await appStore.probeAwake());
   deviceAsleep.value = !alive;
   if (alive) {
     stopWakeRetry();
@@ -66,6 +69,14 @@ async function pingKeepAlive() {
     startWakeRetry();
   }
   return alive;
+}
+
+// Close the hint without silencing the watcher: the state chip in the Photos
+// card keeps reporting, and the 30 s keep-alive reopens the hint if needed.
+// The 5 s wake-retry is stopped so a dismissed hint does not nag.
+function dismissAsleep() {
+  deviceAsleep.value = false;
+  stopWakeRetry();
 }
 
 // While the device is unreachable, poll faster so the hint clears promptly
@@ -181,7 +192,7 @@ onUnmounted(() => {
     </v-main>
 
     <!-- Device-asleep hint: shown when the device stops responding to keep-alive -->
-    <v-dialog v-model="deviceAsleep" max-width="440" persistent>
+    <v-dialog v-model="deviceAsleep" max-width="440">
       <v-card>
         <v-card-title class="d-flex align-center">
           <v-icon icon="mdi-power-sleep" class="mr-2" />
@@ -194,6 +205,7 @@ onUnmounted(() => {
         </v-card-text>
         <v-card-actions>
           <v-spacer />
+          <v-btn color="grey" variant="text" @click="dismissAsleep"> Close </v-btn>
           <v-btn color="primary" variant="text" @click="pingKeepAlive"> Try again </v-btn>
         </v-card-actions>
       </v-card>

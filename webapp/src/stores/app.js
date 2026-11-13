@@ -269,6 +269,16 @@ export const useAppStore = defineStore("app", () => {
     }
   }
 
+  async function probeAwake() {
+    // PHOTOFRAME-001: "is the frame awake?" must not depend on one endpoint.
+    try {
+      const response = await frameFetch(`${API_BASE}/api/system-info`);
+      return response.ok;
+    } catch (_error) {
+      return false;
+    }
+  }
+
   return {
     // State
     albums,
@@ -294,6 +304,7 @@ export const useAppStore = defineStore("app", () => {
     enterSleep,
     rotateNow,
     keepAlive,
+    probeAwake,
     loadSystemInfo,
   };
 });
