@@ -55,5 +55,8 @@
     "server.js",
     "device-config.js",
     "README.md"
-  ]
+  ],
+  "allowScripts": {
+    "canvas@3.2.1": true
+  }
 }
