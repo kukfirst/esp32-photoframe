@@ -59,6 +59,19 @@ const frameSize = computed(() => {
 
 const selected = computed(() => items.value.find((i) => i.id === selectedId.value) || null);
 const pending = computed(() => items.value.filter((i) => i.status !== "done"));
+
+// PHOTOFRAME-001: a frame that supports it chooses the album itself, so no single
+// album grows past the point where the frame can still list it. Rotation reads
+// every album, so what shows on the frame does not change.
+const autoAlbum = computed(() => Boolean(appStore.systemInfo.auto_album));
+const albumLabel = computed(() =>
+  autoAlbum.value ? "across the albums" : `to “${appStore.selectedAlbum}”`
+);
+const albumHint = computed(() =>
+  autoAlbum.value
+    ? "the frame spreads them over albums (≈50 each) and rotates through all of them"
+    : `album ${appStore.selectedAlbum}`
+);
 const doneCount = computed(() => items.value.filter((i) => i.status === "done").length);
 
 async function checkFrame() {
@@ -653,17 +666,42 @@ async function frameFetch(url, init = {}, timeoutMs = FRAME_TIMEOUT_MS) {
   }
 }
 
+// Returns "<album>/<filename>" if the frame already has that photo, otherwise null.
+// "auto" is not an album — with auto placement the photo landed in one of the
+// frame's buckets, so every album has to be asked before a retry sends it twice.
 async function frameHas(album, filename) {
-  try {
-    const resp = await frameFetch(`/api/images?album=${encodeURIComponent(album)}`, {}, 15_000);
-    return resp.ok && (await resp.json()).some((i) => i.filename === filename);
-  } catch {
-    return false;
+  const names = album === "auto" ? appStore.albums.map((a) => a.name) : [album];
+  for (const name of names) {
+    try {
+      const resp = await frameFetch(
+        `/api/images?album=${encodeURIComponent(name)}&limit=1000`,
+        {},
+        15_000
+      );
+      if (resp.ok && (await resp.json()).some((i) => i.filename === filename)) {
+        return `${name}/${filename}`;
+      }
+    } catch {
+      /* this album is unreachable; ask the next one */
+    }
   }
+  return null;
+}
+
+// The frame answers an upload with the path it stored the photo under. With
+// album=auto that is the bucket it chose, and the library has always keyed photos
+// as "<album>/<filename>".
+function frameKey(filepath, album, filename) {
+  if (typeof filepath === "string" && filepath.includes("/")) {
+    return filepath.replace(/^.*\/images\//, "");
+  }
+  return `${album}/${filename}`;
 }
 
 // Send with retries. A timed-out request may still have landed, so before a
-// retry the album is checked for the file instead of sending it twice.
+// retry the album is checked for the file instead of sending it twice. Resolves to
+// the library key ("<album>/<filename>"), which with auto placement is whatever
+// bucket the frame picked.
 async function sendToFrame(item, album, form, filename) {
   for (let attempt = 1; ; attempt++) {
     item.step = attempt === 1 ? "sending" : `sending (try ${attempt} of ${SEND_ATTEMPTS})`;
@@ -672,12 +710,16 @@ async function sendToFrame(item, album, form, filename) {
         method: "POST",
         body: form,
       });
-      if (resp.ok) return;
+      if (resp.ok) {
+        const filepath = (await resp.json().catch(() => null))?.filepath;
+        return frameKey(filepath, album, filename);
+      }
       throw await frameError(resp);
     } catch (e) {
       item.step = "checking whether it arrived";
       await new Promise((r) => setTimeout(r, 5000));
-      if (await frameHas(album, filename)) return;
+      const found = await frameHas(album, filename);
+      if (found) return found;
       if (attempt >= SEND_ATTEMPTS) throw new Error(`${e.message} (tried ${attempt} times)`);
     }
   }
@@ -687,12 +729,11 @@ async function uploadOne(item) {
   item.status = "uploading";
   item.error = null;
   try {
-    const album = appStore.selectedAlbum;
+    const album = appStore.uploadAlbumTarget();
     item.step = "preparing";
     const { form, filename } = await renderForDevice(item);
-    await sendToFrame(item, album, form, filename);
+    const key = await sendToFrame(item, album, form, filename);
     item.step = "saving the original";
-    const key = `${album}/${filename}`;
     // The frame has the new picture; replacing the old one and keeping the
     // original are follow-ups that should not undo a successful send.
     const warnings = [];
@@ -1130,7 +1171,7 @@ const statusIcon = {
         :disabled="uploading || !pending.length || !frameAwake"
         @click="uploadAll"
       >
-        Send {{ pending.length }} to “{{ appStore.selectedAlbum }}”
+        Send {{ pending.length }} {{ albumLabel }}
       </v-btn>
     </v-card-title>
 
@@ -1172,9 +1213,7 @@ const statusIcon = {
       >
         <v-icon icon="mdi-cloud-upload" size="56" color="grey" />
         <p class="text-h6 mt-3 mb-1">Click or drop photos</p>
-        <p class="text-body-2 text-grey mb-0">
-          As many as you like · album <strong>{{ appStore.selectedAlbum }}</strong>
-        </p>
+        <p class="text-body-2 text-grey mb-0">As many as you like · {{ albumHint }}</p>
       </v-sheet>
 
       <template v-else>

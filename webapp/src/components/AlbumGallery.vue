@@ -93,6 +93,16 @@ function getThumbnailUrl(image) {
       </div>
 
       <div class="d-flex align-center flex-wrap gap-2 mb-4">
+        <!-- PHOTOFRAME-001: uploads are spread over several albums, so the gallery
+             needs a view that reads them all. -->
+        <div
+          class="album-chip d-flex align-center"
+          :class="{ 'album-chip--selected': appStore.selectedAlbum === appStore.ALL_ALBUMS }"
+        >
+          <span class="album-name" @click="appStore.selectAlbum(appStore.ALL_ALBUMS)">
+            {{ appStore.ALL_ALBUMS }}
+          </span>
+        </div>
         <div
           v-for="album in appStore.sortedAlbums"
           :key="album.name"

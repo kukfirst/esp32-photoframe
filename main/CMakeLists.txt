@@ -1,4 +1,5 @@
 set(SOURCES
+    "album_listing.c"
     "album_manager.c"
     "cert_pin.c"
     "color_palette.c"

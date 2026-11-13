@@ -48,6 +48,13 @@ typedef enum { IP_MODE_DHCP = 0, IP_MODE_STATIC = 1 } ip_mode_t;
 
 #define DEFAULT_ALBUM_NAME "Default"
 
+// PHOTOFRAME-001: how many photos one album holds before the upload picker starts
+// the next one ("Default", "Default 2", …). Listing an album means walking that
+// album's directory on the SD card, and that walk is what stops answering once an
+// album reaches a few hundred files. Rotation reads every enabled album, so the
+// split does not change what shows on screen.
+#define ALBUM_BUCKET_CAPACITY 50
+
 #include "board_hal.h"
 
 // Overridable so host tests can point the .current.* scheme at a local dir

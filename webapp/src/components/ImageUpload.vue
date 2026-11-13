@@ -228,7 +228,7 @@ async function uploadImage(mode = "upload") {
 
     const uploadUrl = isDirectDisplay
       ? "/api/display-image"
-      : `/api/upload?album=${encodeURIComponent(appStore.selectedAlbum)}`;
+      : `/api/upload?album=${encodeURIComponent(appStore.uploadAlbumTarget())}`;
 
     const response = await fetch(uploadUrl, {
       method: "POST",
@@ -615,7 +615,7 @@ async function generateAiImage() {
       <v-btn variant="text" @click="resetUpload"> Cancel </v-btn>
       <v-spacer />
       <v-select
-        v-if="canSaveToAlbum"
+        v-if="canSaveToAlbum && !appStore.systemInfo.auto_album"
         v-model="appStore.selectedAlbum"
         :items="appStore.sortedAlbums.map((a) => a.name)"
         label="Album"
@@ -625,6 +625,13 @@ async function generateAiImage() {
         style="max-width: 200px"
         class="mr-2"
       />
+      <!-- PHOTOFRAME-001: a frame that places uploads picks the album itself. -->
+      <span
+        v-if="canSaveToAlbum && appStore.systemInfo.auto_album"
+        class="text-body-2 text-grey mr-2"
+      >
+        the frame picks the album
+      </span>
       <v-btn
         v-if="canSaveToAlbum"
         color="secondary"

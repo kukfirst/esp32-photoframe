@@ -1,7 +1,9 @@
 #include "album_manager.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -413,4 +415,89 @@ bool album_manager_album_exists(const char *album_name)
 
     struct stat st;
     return (stat(album_path, &st) == 0 && S_ISDIR(st.st_mode));
+}
+
+// Displayable files in one album, counting with readdir only (no stat() per name —
+// that is exactly the pattern that made the album listing quadratic).
+int album_manager_count_album_images(const char *album_name)
+{
+    char album_path[256];
+    if (album_manager_get_album_path(album_name, album_path, sizeof(album_path)) != ESP_OK) {
+        return -1;
+    }
+
+    DIR *dir = opendir(album_path);
+    if (!dir) {
+        return -1;
+    }
+
+    int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type != DT_REG) {
+            continue;
+        }
+        const char *ext = strrchr(entry->d_name, '.');
+        if (!ext) {
+            continue;
+        }
+        if (strcasecmp(ext, ".bmp") == 0 || strcasecmp(ext, ".png") == 0 ||
+            strcasecmp(ext, ".epdgz") == 0) {
+            count++;
+        }
+    }
+    closedir(dir);
+    return count;
+}
+
+esp_err_t album_manager_pick_upload_album(char *out, size_t out_len, int capacity)
+{
+    if (!out || out_len < 32) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (capacity <= 0) {
+        capacity = ALBUM_BUCKET_CAPACITY;
+    }
+
+    for (int index = 1; index <= 1000; index++) {
+        char name[64];
+        if (index == 1) {
+            snprintf(name, sizeof(name), "%s", DEFAULT_ALBUM_NAME);
+        } else {
+            snprintf(name, sizeof(name), "%s %d", DEFAULT_ALBUM_NAME, index);
+        }
+
+        char album_path[256];
+        if (album_manager_get_album_path(name, album_path, sizeof(album_path)) != ESP_OK) {
+            return ESP_FAIL;
+        }
+
+        int count = album_manager_count_album_images(name);
+        if (count < 0) {
+            if (mkdir(album_path, 0775) != 0) {
+                ESP_LOGE(TAG, "Failed to create album bucket: %s (errno %d)", album_path, errno);
+                return ESP_FAIL;
+            }
+            count = 0;
+            ESP_LOGI(TAG, "Created album bucket: %s", name);
+        }
+
+        if (count >= capacity) {
+            continue;
+        }
+
+        // A bucket that is not enabled is invisible to auto-rotate, so a photo
+        // uploaded into it would never be shown.
+        if (!album_manager_is_album_enabled(name) &&
+            album_manager_set_album_enabled(name, true) != ESP_OK) {
+            ESP_LOGW(TAG, "Album bucket %s was not enabled for rotation", name);
+        }
+
+        snprintf(out, out_len, "%s", name);
+        ESP_LOGI(TAG, "Upload bucket: %s (%d of %d photos)", name, count, capacity);
+        return ESP_OK;
+    }
+
+    ESP_LOGE(TAG, "Ran out of album bucket names");
+    return ESP_FAIL;
 }

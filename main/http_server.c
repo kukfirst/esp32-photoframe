@@ -10,6 +10,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "album_listing.h"
 #include "album_manager.h"
 #include "board_hal.h"
 #include "cJSON.h"
@@ -819,6 +820,18 @@ static esp_err_t upload_image_handler(httpd_req_t *req)
         if (httpd_query_key_value(query, "album", album_param, sizeof(album_param)) == ESP_OK) {
             // URL decode the album name to handle special characters like '+'
             url_decode(album_name, album_param, sizeof(album_name));
+        }
+    }
+
+    // PHOTOFRAME-001: album=auto lets the frame choose, so no single album grows
+    // past the point where walking its directory stops being instant. Clients that
+    // name an album explicitly keep behaving exactly as before.
+    if (strcasecmp(album_name, "auto") == 0) {
+        if (album_manager_pick_upload_album(album_name, sizeof(album_name),
+                                           ALBUM_BUCKET_CAPACITY) != ESP_OK) {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                "Failed to choose an album for this upload");
+            return ESP_FAIL;
         }
     }
 
@@ -1942,6 +1955,16 @@ static esp_err_t album_enabled_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// PHOTOFRAME-001: the album listing used to run one stat() per image to find that
+// image's thumbnail, and every lookup re-walked the album directory — O(N^2) SD
+// traffic. Measured on the owner's frame: a 3-photo album listed in 25 ms, a
+// 301-photo album never answered within 60 s, which is what made the Gallery tab
+// and the "did it arrive?" check spin forever. The scan itself lives in
+// album_listing.c (one readdir pass, thumbnails matched in memory, names sorted);
+// this handler adds paging on top of it.
+#define LISTING_DEFAULT_LIMIT 200
+#define LISTING_MAX_LIMIT 1000
+
 static esp_err_t album_images_handler(httpd_req_t *req)
 {
     if (!system_ready) {
@@ -1956,9 +1979,27 @@ static esp_err_t album_images_handler(httpd_req_t *req)
 
     char query[256];
     char album_name[128] = "";
+    int limit = LISTING_DEFAULT_LIMIT;
+    int offset = 0;
 
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char value[32];
         httpd_query_key_value(query, "album", album_name, sizeof(album_name));
+        if (httpd_query_key_value(query, "limit", value, sizeof(value)) == ESP_OK) {
+            limit = atoi(value);
+            if (limit < 0) {
+                limit = 0;
+            }
+            if (limit > LISTING_MAX_LIMIT) {
+                limit = LISTING_MAX_LIMIT;
+            }
+        }
+        if (httpd_query_key_value(query, "offset", value, sizeof(value)) == ESP_OK) {
+            offset = atoi(value);
+            if (offset < 0) {
+                offset = 0;
+            }
+        }
     }
 
     if (strlen(album_name) == 0) {
@@ -1977,53 +2018,54 @@ static esp_err_t album_images_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    DIR *dir = opendir(album_path);
-    if (!dir) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to open album directory");
+    // One readdir pass, thumbnails matched in memory, names sorted: see
+    // album_listing.c. Sorting is what makes ?offset paging stable while photos
+    // are being added.
+    album_listing_entry_t *entries = NULL;
+    const int image_count = album_listing_scan(album_path, &entries);
+    if (image_count < 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            image_count == -1 ? "Failed to open album directory"
+                                              : "Out of memory listing album");
         return ESP_FAIL;
     }
 
+    // Paging needs a total the client cannot count itself; a client that ignores
+    // ?limit still gets a plain array, exactly as before.
+    char total_header[16];
+    snprintf(total_header, sizeof(total_header), "%d", image_count);
+    httpd_resp_set_hdr(req, "X-Total-Count", total_header);
+
     cJSON *response = cJSON_CreateArray();
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_type == DT_REG) {
-            if (entry->d_name[0] == '.' && entry->d_name[1] == '_') {
-                continue;
-            }
-            const char *ext = strrchr(entry->d_name, '.');
-            if (ext && (strcasecmp(ext, ".bmp") == 0 || strcasecmp(ext, ".png") == 0 ||
-                        strcasecmp(ext, ".epdgz") == 0)) {
-                cJSON *image_obj = cJSON_CreateObject();
-                cJSON_AddStringToObject(image_obj, "filename", entry->d_name);
-                cJSON_AddStringToObject(image_obj, "album", decoded_album_name);
-
-                // Check if a corresponding JPG thumbnail exists for any image type
-                char thumbnail_name[256];
-                char thumbnail_path[512];
-
-                // Extract base name without extension
-                int base_len = ext - entry->d_name;
-                snprintf(thumbnail_name, sizeof(thumbnail_name), "%.*s.jpg", base_len,
-                         entry->d_name);
-                snprintf(thumbnail_path, sizeof(thumbnail_path), "%s/%s", album_path,
-                         thumbnail_name);
-
-                // Check if thumbnail file exists
-                struct stat st;
-                if (stat(thumbnail_path, &st) == 0) {
-                    cJSON_AddStringToObject(image_obj, "thumbnail", thumbnail_name);
-                }
-
-                cJSON_AddItemToArray(response, image_obj);
-            }
-        }
+    if (!response) {
+        album_listing_free(entries, image_count);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        return ESP_FAIL;
     }
-    closedir(dir);
 
-    char *json_str = cJSON_Print(response);
+    int sent = 0;
+    for (int i = offset; i < image_count && (limit == 0 || sent < limit); i++) {
+        cJSON *image_obj = cJSON_CreateObject();
+        if (!image_obj) {
+            break;
+        }
+        cJSON_AddStringToObject(image_obj, "filename", entries[i].filename);
+        cJSON_AddStringToObject(image_obj, "album", decoded_album_name);
+        if (entries[i].thumbnail) {
+            cJSON_AddStringToObject(image_obj, "thumbnail", entries[i].thumbnail);
+        }
+        cJSON_AddItemToArray(response, image_obj);
+        sent++;
+    }
+
+    album_listing_free(entries, image_count);
+
+    char *json_str = cJSON_PrintUnformatted(response);
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, json_str);
-    free(json_str);
+    if (json_str) {
+        httpd_resp_sendstr(req, json_str);
+        free(json_str);
+    }
     cJSON_Delete(response);
     return ESP_OK;
 }
@@ -2107,6 +2149,13 @@ static esp_err_t system_info_handler(httpd_req_t *req)
 #endif
     cJSON_AddBoolToObject(response, "sdcard_inserted", sdcard_inserted);
     cJSON_AddBoolToObject(response, "has_flash_storage", has_flash_storage);
+
+    // PHOTOFRAME-001: what this build's album endpoints support. The webapp uses
+    // these to turn on paging and auto-placed uploads only when the frame really
+    // does them — older firmware would otherwise create an album literally named
+    // "auto" and never show the photos in it.
+    cJSON_AddBoolToObject(response, "images_paging", true);
+    cJSON_AddBoolToObject(response, "auto_album", true);
 
     // Pass along new storage properties
     cJSON_AddNumberToObject(response, "storage_total", storage_total);

@@ -48,6 +48,14 @@ export const useAppStore = defineStore("app", () => {
   const frameFetch = (url, init = {}) =>
     fetch(url, { ...init, signal: AbortSignal.timeout(FRAME_TIMEOUT_MS) });
 
+  // PHOTOFRAME-001: the frame now spreads uploads over several albums ("Default",
+  // "Default 2", …) so that no single album grows past the point where walking its
+  // directory stops being instant. The Gallery therefore needs to be able to look
+  // at every album at once — ALL_ALBUMS is that pseudo-album. A real album that
+  // happens to be named this still wins.
+  const ALL_ALBUMS = "All albums";
+  const IMAGES_PAGE_SIZE = 100;
+
   // Getters
   const sortedAlbums = computed(() => {
     return [...albums.value].sort((a, b) => {
@@ -103,6 +111,51 @@ export const useAppStore = defineStore("app", () => {
     }
   }
 
+  async function fetchImagePage(albumName, offset) {
+    const response = await frameFetch(
+      `${API_BASE}/api/images?album=${encodeURIComponent(albumName)}&limit=${IMAGES_PAGE_SIZE}&offset=${offset}`
+    );
+    if (!response.ok || response.headers.get("content-type")?.includes("text/html")) {
+      return null;
+    }
+    const batch = await response.json();
+    if (!Array.isArray(batch)) {
+      return null;
+    }
+    return { batch, total: Number(response.headers.get("x-total-count")) };
+  }
+
+  // Paged so the response stays small on a big album. Firmware that ignores
+  // ?limit/?offset answers the whole album at once and sends no X-Total-Count —
+  // in that case one page already is everything, and asking again would fetch the
+  // same album twice.
+  async function fetchAllImages(albumName) {
+    const collected = [];
+    let offset = 0;
+    for (let page = 0; page < 100; page++) {
+      const result = await fetchImagePage(albumName, offset);
+      if (!result || result.batch.length === 0) {
+        break;
+      }
+      collected.push(...result.batch);
+      offset += result.batch.length;
+      if (!Number.isFinite(result.total) || offset >= result.total) {
+        break;
+      }
+    }
+    return collected;
+  }
+
+  async function albumNamesToRead(albumName) {
+    if (albumName !== ALL_ALBUMS || albums.value.some((album) => album.name === ALL_ALBUMS)) {
+      return [albumName];
+    }
+    if (albums.value.length === 0) {
+      await loadAlbums();
+    }
+    return albums.value.map((album) => album.name);
+  }
+
   async function loadImages(albumName) {
     loading.value.images = true;
     try {
@@ -110,20 +163,28 @@ export const useAppStore = defineStore("app", () => {
         images.value = [];
         return;
       }
-      const response = await frameFetch(
-        `${API_BASE}/api/images?album=${encodeURIComponent(albumName)}`
-      );
-      if (!response.ok || response.headers.get("content-type")?.includes("text/html")) {
-        images.value = [];
-        return;
+      const names = await albumNamesToRead(albumName);
+      const merged = [];
+      for (const name of names) {
+        merged.push(...(await fetchAllImages(name)));
       }
-      images.value = await response.json();
+      images.value = merged;
     } catch (error) {
       console.log("Failed to load images (standalone mode):", error);
       images.value = [];
     } finally {
       loading.value.images = false;
     }
+  }
+
+  // Where an upload should go: the frame chooses the album when it advertises the
+  // feature; older firmware would create an album literally named "auto" and never
+  // show it, so those keep the album the user picked.
+  function uploadAlbumTarget() {
+    if (systemInfo.value.auto_album) {
+      return "auto";
+    }
+    return selectedAlbum.value === ALL_ALBUMS ? "Default" : selectedAlbum.value;
   }
 
   function selectAlbum(albumName) {
@@ -281,6 +342,7 @@ export const useAppStore = defineStore("app", () => {
 
   return {
     // State
+    ALL_ALBUMS,
     albums,
     selectedAlbum,
     images,
@@ -296,6 +358,7 @@ export const useAppStore = defineStore("app", () => {
     loadAlbums,
     loadImages,
     selectAlbum,
+    uploadAlbumTarget,
     toggleAlbumEnabled,
     createAlbum,
     deleteAlbum,

@@ -39,7 +39,9 @@ onMounted(async () => {
   if (appStore.isGrayscale) {
     settingsStore.applyGrayscaleDefaultIfUntouched();
   }
-  appStore.selectAlbum("Default");
+  // PHOTOFRAME-001: on a frame that places uploads itself, the photos land in
+  // several albums, so the gallery opens on all of them at once.
+  appStore.selectAlbum(appStore.systemInfo.auto_album ? appStore.ALL_ALBUMS : "Default");
 
   // Refresh battery every 30s
   setInterval(() => appStore.loadBatteryStatus(), 30000);
