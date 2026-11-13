@@ -18,6 +18,7 @@ import ProcessingControls from "./ProcessingControls.vue";
 import { getPresetOptions } from "@aitjcize/epaper-image-convert";
 import { dither } from "../utils/ditherPool";
 import { editRequest, importRequest } from "../utils/editRequest";
+import { progressLabel, progressPercent, sendOutcome } from "../utils/sendProgress";
 
 const appStore = useAppStore();
 const settingsStore = useSettingsStore();
@@ -423,6 +424,7 @@ function newItem(file, extra = {}) {
 }
 
 async function addFiles(fileList, extra = {}) {
+  sendStopped.value = null;
   const added = [];
   for (const file of Array.from(fileList || [])) {
     if (!file.type.startsWith("image/")) continue;
@@ -507,9 +509,14 @@ function editState(item) {
   };
 }
 
-async function libraryFetch(url, init) {
+// PHOTOFRAME-002: the helper used to be the one request in a send with no
+// deadline. If 18087 stopped answering, the item sat in "saving the original"
+// forever and the whole batch never finished.
+const LIBRARY_TIMEOUT_MS = 30_000;
+
+async function libraryFetch(url, init = {}) {
   try {
-    return await fetch(url, init);
+    return await fetch(url, { ...init, signal: AbortSignal.timeout(LIBRARY_TIMEOUT_MS) });
   } catch {
     throw new Error("The cachypc helper service is not reachable (cachypc/upscale/server.py).");
   }
@@ -590,12 +597,14 @@ function remove(item) {
 }
 
 function clearDone() {
+  sendStopped.value = null;
   items.value = items.value.filter((i) => i.status !== "done");
   if (!selected.value) selectedId.value = items.value[0]?.id ?? null;
   renderPreview();
 }
 
 function clearAll() {
+  sendStopped.value = null;
   items.value = [];
   selectedId.value = null;
 }
@@ -785,13 +794,17 @@ async function showOnFrame(item) {
 }
 
 const sendProgress = ref({ done: 0, total: 0, current: null });
+// Set when a send stopped early, so the list can say why instead of looking stuck.
+const sendStopped = ref(null);
 
 async function uploadAll() {
   await checkFrame();
   if (!frameAwake.value) return;
   uploading.value = true;
+  sendStopped.value = null;
   const queue = pending.value.filter((i) => i.status !== "reading");
   sendProgress.value = { done: 0, total: queue.length, current: null };
+  let asleep = false;
   try {
     for (const item of queue) {
       sendProgress.value.current = item;
@@ -799,13 +812,22 @@ async function uploadAll() {
       sendProgress.value.done++;
       if (item.status === "error") {
         await checkFrame();
-        if (!frameAwake.value) break;
+        if (!frameAwake.value) {
+          asleep = true;
+          break;
+        }
       }
     }
   } finally {
     uploading.value = false;
     sendProgress.value.current = null;
   }
+  sendStopped.value = sendOutcome({
+    sent: queue.filter((i) => i.status === "done").length,
+    failed: queue.filter((i) => i.status === "error").length,
+    left: pending.value.length,
+    asleep,
+  });
   // PHOTOFRAME-001: the album refresh is a follow-up, never part of the send.
   // Awaiting it here meant a frame that stops answering pinned `uploading`
   // forever: the "Sending N / M" spinner spun on and Send stayed disabled.
@@ -1179,16 +1201,31 @@ const statusIcon = {
     <v-sheet v-if="uploading" rounded border class="mx-4 mb-2 pa-3">
       <div class="d-flex align-center ga-2 mb-2 text-body-2">
         <v-progress-circular indeterminate size="16" width="2" />
-        <strong>Sending {{ sendProgress.done + 1 }} / {{ sendProgress.total }}</strong>
+        <!-- PHOTOFRAME-002: this used to read `done + 1 / total` straight from the
+             counts, so the last photo of a 25-photo batch showed "26 / 25" and any
+             request that never came back left it there. -->
+        <strong>{{ progressLabel(sendProgress.done, sendProgress.total) }}</strong>
         <span class="text-medium-emphasis text-truncate">
           {{ sendProgress.current?.name }} — {{ sendProgress.current?.step }}
         </span>
       </div>
       <v-progress-linear
-        :model-value="(sendProgress.done / (sendProgress.total || 1)) * 100"
+        :model-value="progressPercent(sendProgress.done, sendProgress.total)"
         rounded
       />
     </v-sheet>
+
+    <v-alert
+      v-if="sendStopped && !uploading"
+      :type="sendStopped.level"
+      variant="tonal"
+      density="compact"
+      class="mx-4 mb-2 text-body-2"
+      closable
+      @update:model-value="sendStopped = null"
+    >
+      {{ sendStopped.text }}
+    </v-alert>
 
     <v-card-text>
       <input
